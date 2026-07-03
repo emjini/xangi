@@ -1,3 +1,4 @@
+import { EventEmitter } from 'events';
 import { PersistentRunner } from './persistent-runner.js';
 import type { AgentRunner, RunOptions, RunResult, StreamCallbacks } from './agent-runner.js';
 import type { AgentConfig } from './config.js';
@@ -17,7 +18,7 @@ interface PoolEntry {
  * チャンネルごとに独立した PersistentRunner を管理し、
  * LRU eviction とアイドルタイムアウトでリソースを制御する。
  */
-export class RunnerManager implements AgentRunner {
+export class RunnerManager extends EventEmitter implements AgentRunner {
   private pool = new Map<string, PoolEntry>();
   private maxProcesses: number;
   private idleTimeoutMs: number;
@@ -36,6 +37,7 @@ export class RunnerManager implements AgentRunner {
       idleTimeoutMs?: number;
     }
   ) {
+    super();
     this.agentConfig = agentConfig;
     this.maxProcesses = options?.maxProcesses ?? 10;
     this.idleTimeoutMs = options?.idleTimeoutMs ?? 30 * 60 * 1000; // 30分
@@ -74,6 +76,11 @@ export class RunnerManager implements AgentRunner {
           `[runner-manager] Session invalidated for channel ${ch} (was: ${oldSessionId?.slice(0, 8) ?? 'none'}). Deleted from sessions.json.`
         );
       }
+    });
+
+    // 自発ターン（バックグラウンドタスク完了通知など）の応答をindex.ts側へ転送
+    runner.on('unsolicited-message', (ch: string, text: string) => {
+      this.emit('unsolicited-message', ch, text);
     });
 
     this.pool.set(channelId, {

@@ -11,6 +11,7 @@ import {
 } from 'discord.js';
 import { loadConfig } from './config.js';
 import { createAgentRunner, getBackendDisplayName, type AgentRunner } from './agent-runner.js';
+import { RunnerManager } from './runner-manager.js';
 import { ClaudeCodeRunner } from './claude-code.js';
 import { processManager } from './process-manager.js';
 import { loadSkills, formatSkillList, type Skill } from './skills.js';
@@ -126,6 +127,14 @@ async function main() {
   const agentRunner = createAgentRunner(config.agent.backend, config.agent.config);
   const backendName = getBackendDisplayName(config.agent.backend);
   console.log(`[xangi] Using ${backendName} as agent backend`);
+
+  // 自発ターン（バックグラウンドタスク完了通知など）の応答をDiscordへ配信
+  // リクエスト起点がないため通常フローでは送信されず、従来は破棄されていた
+  if (agentRunner instanceof RunnerManager) {
+    agentRunner.on('unsolicited-message', (unsolicitedChannelId: string, text: string) => {
+      void deliverUnsolicitedResponse(unsolicitedChannelId, text);
+    });
+  }
 
   // スキルを読み込み
   const workdir = config.agent.config.workdir || process.cwd();
@@ -897,6 +906,56 @@ async function main() {
   }
 
   /**
+   * リクエスト起点のない応答（バックグラウンドタスク完了通知への応答など）をチャンネルへ配信
+   * 通常のメッセージ応答フローと同じ後処理（MEDIA添付・SYSTEM_COMMAND・!discordコマンド）を通す
+   */
+  async function deliverUnsolicitedResponse(channelId: string, result: string): Promise<void> {
+    try {
+      if (!channelId || channelId === '__default__') {
+        console.warn('[xangi] Unsolicited response has no channel context. Dropping.');
+        return;
+      }
+      const channel = await client.channels.fetch(channelId);
+      if (!channel || !('send' in channel)) {
+        console.warn(`[xangi] Unsolicited response channel ${channelId} is not sendable.`);
+        return;
+      }
+      const sendable = channel as unknown as {
+        send: (content: string | { files: { attachment: string }[] }) => Promise<unknown>;
+      };
+
+      const filePaths = extractFilePaths(result);
+      const displayText = filePaths.length > 0 ? stripFilePaths(result) : result;
+      const cleanText = stripCommandsFromDisplay(displayText);
+
+      if (cleanText.trim()) {
+        const chunks = splitMessage(cleanText, DISCORD_SAFE_LENGTH);
+        for (const chunk of chunks) {
+          await sendable.send(chunk);
+        }
+      }
+
+      if (filePaths.length > 0) {
+        try {
+          await sendable.send({ files: filePaths.map((fp) => ({ attachment: fp })) });
+          console.log(`[xangi] Sent ${filePaths.length} file(s) (unsolicited)`);
+        } catch (err) {
+          console.error('[xangi] Failed to send files (unsolicited):', err);
+        }
+      }
+
+      handleSettingsFromResponse(result);
+      await handleDiscordCommandsInResponse(result, undefined, channelId);
+
+      console.log(
+        `[xangi] Delivered unsolicited response to channel ${channelId} (${result.length} chars)`
+      );
+    } catch (err) {
+      console.error('[xangi] Failed to deliver unsolicited response:', err);
+    }
+  }
+
+  /**
    * AIの応答から !discord コマンドを検知して実行
    * コードブロック内のコマンドは無視する
    * !discord send は複数行メッセージに対応（次の !discord / !schedule コマンド行まで吸収）
@@ -1118,6 +1177,13 @@ async function main() {
     const isAutoReplyChannel =
       config.discord.autoReplyChannels?.includes(message.channel.id) ?? false;
 
+    const isOtherBotMention =
+      !isMentioned && message.mentions.users.some((u) => u.bot && u.id !== client.user!.id);
+    if (isOtherBotMention) {
+      console.log(`[xangi] Skipping message mentioning other bot only: ${message.channel.id}`);
+      return;
+    }
+
     if (!isMentioned && !isDM && !isAutoReplyChannel) return;
 
     // 同じチャンネルで処理中なら無視（メンション時は除く）
@@ -1264,7 +1330,18 @@ async function main() {
 
   // Discordボットを起動
   if (config.discord.enabled) {
-    await client.login(config.discord.token);
+    // ネットワーク不通時に discord.js が無限リトライでハングするのを防ぐため
+    // login にタイムアウトを設ける。失敗したら exit して pm2 に再起動させる。
+    const LOGIN_TIMEOUT_MS = 30_000;
+    await Promise.race([
+      client.login(config.discord.token),
+      new Promise<never>((_, reject) =>
+        setTimeout(
+          () => reject(new Error(`Discord login timed out after ${LOGIN_TIMEOUT_MS}ms`)),
+          LOGIN_TIMEOUT_MS
+        )
+      ),
+    ]);
     console.log('[xangi] Discord bot started');
 
     // スケジューラにDiscord送信関数を登録
@@ -2347,4 +2424,7 @@ async function executeScheduleFromResponse(
   }
 }
 
-main().catch(console.error);
+main().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
