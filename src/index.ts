@@ -902,6 +902,68 @@ async function main() {
       }
     }
 
+    // !discord thread-status <emoji>
+    const threadStatusMatch = text.match(/^!discord\s+thread-status\s+(\S+)\s*$/);
+    if (threadStatusMatch) {
+      const emoji = threadStatusMatch[1];
+      const STATUS_EMOJIS = ['🟢', '🟡', '🔵'] as const;
+
+      // ホワイトリスト厳格一致
+      if (!(STATUS_EMOJIS as readonly string[]).includes(emoji)) {
+        return {
+          handled: true,
+          feedback: true,
+          response: `❌ 対応絵文字は 🟢 / 🟡 / 🔵 のいずれかです（指定: ${emoji}）`,
+        };
+      }
+
+      // スレッドコンテキストを取得
+      const channel = sourceMessage?.channel;
+      if (
+        !channel ||
+        !('isThread' in channel) ||
+        !(channel as { isThread: () => boolean }).isThread()
+      ) {
+        return {
+          handled: true,
+          feedback: true,
+          response: '❌ この機能はスレッド内でのみ使用可能です',
+        };
+      }
+
+      const thread = channel as { name: string; setName: (n: string) => Promise<unknown> };
+      const currentName = thread.name;
+
+      // 先頭が既存の状態絵文字なら1文字剥がす（固定文字列startsWith、正規表現不使用）
+      let stripped = currentName;
+      for (const e of STATUS_EMOJIS) {
+        if (stripped.startsWith(e)) {
+          stripped = stripped.slice(e.length).replace(/^\s+/, '');
+          break;
+        }
+      }
+
+      // 新名を生成（先頭に絵文字＋半角スペース）
+      let newName = `${emoji} ${stripped}`;
+
+      // 100字クランプ（Discord スレッド名上限）
+      if (newName.length > 100) {
+        newName = newName.slice(0, 100);
+      }
+
+      // diff-check: 変化なしなら API 呼ばない（レートリミット対策）
+      if (newName === currentName) {
+        return { handled: true, feedback: false };
+      }
+
+      // fire-and-forget: awaitしない、失敗時はログのみで応答パイプライン継続
+      thread.setName(newName).catch((err: unknown) => {
+        console.error('[xangi] thread-status rename failed:', err);
+      });
+
+      return { handled: true, feedback: false };
+    }
+
     return { handled: false };
   }
 
@@ -1170,6 +1232,7 @@ async function main() {
 
   // メッセージ処理
   client.on(Events.MessageCreate, async (message) => {
+    if (message.system) return;
     if (message.author.bot) return;
 
     const isMentioned = message.mentions.has(client.user!);
