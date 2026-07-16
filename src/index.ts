@@ -33,7 +33,63 @@ import {
   type ScheduleType,
 } from './scheduler.js';
 import { initSessions, getSession, setSession, deleteSession } from './sessions.js';
+import {
+  THREAD_STATUS_EMOJIS,
+  buildThreadStateName,
+  detectManualThreadState,
+  detectThreadState,
+  type ThreadStateEmoji,
+} from './thread-status.js';
 import { join } from 'path';
+
+type ThreadStateSetter = (threadId: string, emoji: ThreadStateEmoji) => void;
+
+const configuredBlueThreshold = Number(process.env.THREAD_STATUS_BLUE_THRESHOLD_MS ?? '60000');
+const THREAD_STATUS_BLUE_THRESHOLD_MS =
+  Number.isFinite(configuredBlueThreshold) && configuredBlueThreshold >= 0
+    ? configuredBlueThreshold
+    : 60000;
+
+function getThreadChannel(channel: unknown): {
+  id: string;
+  name: string;
+  parentId: string | null;
+  isThread: () => boolean;
+  setName: (name: string) => Promise<unknown>;
+  setAppliedTags: (tagIds: readonly string[]) => Promise<unknown>;
+} | null {
+  if (
+    channel &&
+    typeof (channel as { isThread?: unknown }).isThread === 'function' &&
+    (channel as { isThread: () => boolean }).isThread()
+  ) {
+    return channel as {
+      id: string;
+      name: string;
+      parentId: string | null;
+      isThread: () => boolean;
+      setName: (name: string) => Promise<unknown>;
+      setAppliedTags: (tagIds: readonly string[]) => Promise<unknown>;
+    };
+  }
+  return null;
+}
+
+function startThreadStatusBlueTimer(
+  channel: unknown,
+  setThreadState: ThreadStateSetter
+): ReturnType<typeof setTimeout> | undefined {
+  const thread = getThreadChannel(channel);
+  if (!thread) return undefined;
+
+  return setTimeout(() => {
+    try {
+      setThreadState(thread.id, '🔵');
+    } catch (error) {
+      console.error('[xangi] Failed to set delayed thread state:', error);
+    }
+  }, THREAD_STATUS_BLUE_THRESHOLD_MS);
+}
 
 /** メッセージを指定文字数で分割（カスタムセパレータ対応、デフォルトは行単位） */
 function splitMessage(text: string, maxLength: number, separator: string = '\n'): string[] {
@@ -122,6 +178,171 @@ async function main() {
       GatewayIntentBits.MessageContent,
     ],
   });
+
+  const threadDesiredState = new Map<string, ThreadStateEmoji>();
+  const forumTagIdCache = new Map<string, Promise<Map<ThreadStateEmoji, string>>>();
+  const renameStates = new Map<string, { desiredName: string; inFlight: boolean }>();
+
+  // Known gap: a crash after 🔵 is applied but before the final state is applied can leave 🔵 behind.
+  // Persisting in-flight state and cleaning stale 🔵 threads at startup is deferred to a later stage.
+  async function resolveTagId(
+    forumId: string,
+    emoji: ThreadStateEmoji
+  ): Promise<string | undefined> {
+    let cached = forumTagIdCache.get(forumId);
+    if (!cached) {
+      cached = (async () => {
+        const forum = await client.channels.fetch(forumId);
+        const tagIds = new Map<ThreadStateEmoji, string>();
+        if (!forum || !forum.isThreadOnly()) return tagIds;
+
+        for (const tag of forum.availableTags) {
+          const tagEmoji = tag.emoji?.name;
+          if (tagEmoji && (THREAD_STATUS_EMOJIS as readonly string[]).includes(tagEmoji)) {
+            tagIds.set(tagEmoji as ThreadStateEmoji, tag.id);
+          }
+        }
+        return tagIds;
+      })();
+      forumTagIdCache.set(forumId, cached);
+    }
+
+    try {
+      return (await cached).get(emoji);
+    } catch (error) {
+      forumTagIdCache.delete(forumId);
+      throw error;
+    }
+  }
+
+  function applyRename(
+    threadId: string,
+    thread: { setName: (name: string) => Promise<unknown> }
+  ): void {
+    const state = renameStates.get(threadId);
+    if (!state) return;
+    const applyingName = state.desiredName;
+
+    let request: Promise<unknown>;
+    try {
+      request = thread.setName(applyingName);
+    } catch (error) {
+      console.error('[xangi] thread-status rename failed:', error);
+      if (state.desiredName !== applyingName) {
+        applyRename(threadId, thread);
+      } else {
+        state.inFlight = false;
+      }
+      return;
+    }
+
+    void request
+      .catch((error: unknown) => {
+        console.error('[xangi] thread-status rename failed:', error);
+      })
+      .finally(() => {
+        const latest = renameStates.get(threadId);
+        if (!latest) return;
+        if (latest.desiredName !== applyingName) {
+          applyRename(threadId, thread);
+        } else {
+          latest.inFlight = false;
+        }
+      });
+  }
+
+  function setRename(
+    threadId: string,
+    thread: { setName: (name: string) => Promise<unknown> },
+    name: string
+  ): void {
+    const state = renameStates.get(threadId);
+    if (state) {
+      state.desiredName = name;
+      if (state.inFlight) return;
+      state.inFlight = true;
+    } else {
+      renameStates.set(threadId, { desiredName: name, inFlight: true });
+    }
+    applyRename(threadId, thread);
+  }
+
+  const setThreadState: ThreadStateSetter = (threadId, emoji) => {
+    try {
+      if (threadDesiredState.get(threadId) === emoji) return;
+      threadDesiredState.set(threadId, emoji);
+
+      void (async () => {
+        const channel =
+          client.channels.cache.get(threadId) ?? (await client.channels.fetch(threadId));
+        const thread = getThreadChannel(channel);
+        if (!thread) return;
+
+        if (thread.parentId) {
+          void resolveTagId(thread.parentId, emoji)
+            .then((tagId) => {
+              if (!tagId) return;
+              void thread.setAppliedTags([tagId]).catch((error: unknown) => {
+                console.error('[xangi] thread-status tag update failed:', error);
+              });
+            })
+            .catch((error: unknown) => {
+              console.error('[xangi] thread-status tag resolution failed:', error);
+            });
+        }
+
+        const desiredName = buildThreadStateName(thread.name, emoji);
+        if (desiredName !== thread.name || renameStates.get(threadId)?.inFlight) {
+          setRename(threadId, thread, desiredName);
+        }
+      })().catch((error: unknown) => {
+        console.error('[xangi] Failed to apply thread state:', error);
+      });
+    } catch (error) {
+      console.error('[xangi] Failed to set thread state:', error);
+    }
+  };
+
+  async function resolveResponseThread(
+    sourceMessage?: Message,
+    fallbackChannelId?: string
+  ): Promise<ReturnType<typeof getThreadChannel>> {
+    try {
+      const channel =
+        sourceMessage?.channel ??
+        (fallbackChannelId ? await client.channels.fetch(fallbackChannelId) : null);
+      return getThreadChannel(channel);
+    } catch (error) {
+      console.error('[xangi] Failed to resolve response thread:', error);
+      return null;
+    }
+  }
+
+  async function applyThreadStateFromResponse(
+    text: string,
+    sourceMessage?: Message,
+    fallbackChannelId?: string
+  ): Promise<void> {
+    try {
+      const thread = await resolveResponseThread(sourceMessage, fallbackChannelId);
+      if (!thread) return;
+
+      const manualState = detectManualThreadState(text);
+      if (manualState) {
+        setThreadState(thread.id, manualState);
+        return;
+      }
+
+      const detectedState = detectThreadState(text);
+      if (detectedState) {
+        setThreadState(thread.id, detectedState);
+      } else if (threadDesiredState.get(thread.id) === '🔵') {
+        setThreadState(thread.id, '🟡');
+      }
+    } catch (error) {
+      console.error('[xangi] Failed to detect thread state:', error);
+    }
+  }
 
   // エージェントランナーを作成
   const agentRunner = createAgentRunner(config.agent.backend, config.agent.config);
@@ -288,6 +509,8 @@ async function main() {
     if (interaction.commandName === 'stop') {
       const stopped = processManager.stop(channelId) || agentRunner.cancel?.(channelId) || false;
       if (stopped) {
+        const thread = getThreadChannel(interaction.channel);
+        if (thread) setThreadState(thread.id, '🟡');
         await interaction.reply('🛑 タスクを停止しました');
       } else {
         await interaction.reply({ content: '実行中のタスクはありません', ephemeral: true });
@@ -304,6 +527,7 @@ async function main() {
     if (interaction.commandName === 'skip') {
       const skipMessage = interaction.options.getString('message', true);
       await interaction.deferReply();
+      const threadStatusTimer = startThreadStatusBlueTimer(interaction.channel, setThreadState);
 
       try {
         const sessionId = getSession(channelId);
@@ -315,6 +539,7 @@ async function main() {
           sessionId,
           channelId,
         });
+        if (threadStatusTimer) clearTimeout(threadStatusTimer);
 
         setSession(channelId, runResult.sessionId);
 
@@ -360,6 +585,8 @@ async function main() {
           await handleDiscordCommandsInResponse(runResult.result, fakeMessage);
         }
       } catch (error) {
+        const thread = getThreadChannel(interaction.channel);
+        if (thread) setThreadState(thread.id, '🟡');
         const errorMsg = error instanceof Error ? error.message : String(error);
         let errorDetail: string;
         if (errorMsg.includes('timed out')) {
@@ -372,6 +599,8 @@ async function main() {
           errorDetail = `❌ エラー: ${errorMsg.slice(0, 200)}`;
         }
         await interaction.editReply(errorDetail).catch(() => {});
+      } finally {
+        if (threadStatusTimer) clearTimeout(threadStatusTimer);
       }
       return;
     }
@@ -400,7 +629,11 @@ async function main() {
     }
 
     if (interaction.commandName === 'skill') {
-      await handleSkill(interaction, agentRunner, config, channelId);
+      const result = await handleSkill(interaction, agentRunner, config, channelId, setThreadState);
+      if (result && interaction.channel) {
+        const fakeMessage = { channel: interaction.channel } as Message;
+        await applyThreadStateFromResponse(result, fakeMessage);
+      }
       return;
     }
 
@@ -416,7 +649,18 @@ async function main() {
     });
 
     if (matchedSkill) {
-      await handleSkillCommand(interaction, agentRunner, config, channelId, matchedSkill.name);
+      const result = await handleSkillCommand(
+        interaction,
+        agentRunner,
+        config,
+        channelId,
+        matchedSkill.name,
+        setThreadState
+      );
+      if (result && interaction.channel) {
+        const fakeMessage = { channel: interaction.channel } as Message;
+        await applyThreadStateFromResponse(result, fakeMessage);
+      }
       return;
     }
   });
@@ -906,10 +1150,9 @@ async function main() {
     const threadStatusMatch = text.match(/^!discord\s+thread-status\s+(\S+)\s*$/);
     if (threadStatusMatch) {
       const emoji = threadStatusMatch[1];
-      const STATUS_EMOJIS = ['🟢', '🟡', '🔵'] as const;
 
       // ホワイトリスト厳格一致
-      if (!(STATUS_EMOJIS as readonly string[]).includes(emoji)) {
+      if (!(THREAD_STATUS_EMOJIS as readonly string[]).includes(emoji)) {
         return {
           handled: true,
           feedback: true,
@@ -918,12 +1161,8 @@ async function main() {
       }
 
       // スレッドコンテキストを取得
-      const channel = sourceMessage?.channel;
-      if (
-        !channel ||
-        !('isThread' in channel) ||
-        !(channel as { isThread: () => boolean }).isThread()
-      ) {
+      const thread = await resolveResponseThread(sourceMessage, fallbackChannelId);
+      if (!thread) {
         return {
           handled: true,
           feedback: true,
@@ -931,35 +1170,7 @@ async function main() {
         };
       }
 
-      const thread = channel as { name: string; setName: (n: string) => Promise<unknown> };
-      const currentName = thread.name;
-
-      // 先頭が既存の状態絵文字なら1文字剥がす（固定文字列startsWith、正規表現不使用）
-      let stripped = currentName;
-      for (const e of STATUS_EMOJIS) {
-        if (stripped.startsWith(e)) {
-          stripped = stripped.slice(e.length).replace(/^\s+/, '');
-          break;
-        }
-      }
-
-      // 新名を生成（先頭に絵文字＋半角スペース）
-      let newName = `${emoji} ${stripped}`;
-
-      // 100字クランプ（Discord スレッド名上限）
-      if (newName.length > 100) {
-        newName = newName.slice(0, 100);
-      }
-
-      // diff-check: 変化なしなら API 呼ばない（レートリミット対策）
-      if (newName === currentName) {
-        return { handled: true, feedback: false };
-      }
-
-      // fire-and-forget: awaitしない、失敗時はログのみで応答パイプライン継続
-      thread.setName(newName).catch((err: unknown) => {
-        console.error('[xangi] thread-status rename failed:', err);
-      });
+      setThreadState(thread.id, emoji as ThreadStateEmoji);
 
       return { handled: true, feedback: false };
     }
@@ -1219,6 +1430,8 @@ async function main() {
       i++;
     }
 
+    await applyThreadStateFromResponse(text, sourceMessage, fallbackChannelId);
+
     return feedbackResults;
   }
 
@@ -1361,7 +1574,8 @@ async function main() {
         prompt,
         skipPermissions,
         channelId,
-        config
+        config,
+        setThreadState
       );
 
       // AIの応答から !discord コマンドを検知して実行
@@ -1378,7 +1592,8 @@ async function main() {
             feedbackPrompt,
             skipPermissions,
             channelId,
-            config
+            config,
+            setThreadState
           );
           // 再注入後の応答にもコマンドがあれば処理（ただし再帰は1回のみ）
           if (feedbackResult) {
@@ -1444,6 +1659,7 @@ async function main() {
           send: (content: string) => Promise<{ edit: (content: string) => Promise<unknown> }>;
         }
       ).send('🤔 考え中...');
+      let threadStatusTimer = startThreadStatusBlueTimer(channel, setThreadState);
 
       try {
         // タイムスタンプをプロンプトの先頭に注入
@@ -1461,6 +1677,10 @@ async function main() {
           sessionId,
           channelId,
         });
+        if (threadStatusTimer) {
+          clearTimeout(threadStatusTimer);
+          threadStatusTimer = undefined;
+        }
 
         setSession(channelId, newSessionId);
 
@@ -1474,11 +1694,16 @@ async function main() {
             `[scheduler] Re-injecting ${feedbackResults.length} feedback result(s) to agent`
           );
           const feedbackSession = getSession(channelId);
+          threadStatusTimer = startThreadStatusBlueTimer(channel, setThreadState);
           const feedbackRun = await agentRunner.run(feedbackPrompt, {
             skipPermissions: config.agent.config.skipPermissions ?? false,
             sessionId: feedbackSession,
             channelId,
           });
+          if (threadStatusTimer) {
+            clearTimeout(threadStatusTimer);
+            threadStatusTimer = undefined;
+          }
           setSession(channelId, feedbackRun.sessionId);
           // 再注入後の応答にもコマンドがあれば処理
           await handleDiscordCommandsInResponse(feedbackRun.result, undefined, channelId);
@@ -1512,6 +1737,8 @@ async function main() {
 
         return result;
       } catch (error) {
+        const thread = getThreadChannel(channel);
+        if (thread) setThreadState(thread.id, '🟡');
         if (error instanceof Error && error.message === 'Request cancelled by user') {
           await thinkingMsg.edit('🛑 タスクを停止しました');
         } else {
@@ -1529,6 +1756,8 @@ async function main() {
           await thinkingMsg.edit(errorDetail);
         }
         throw error;
+      } finally {
+        if (threadStatusTimer) clearTimeout(threadStatusTimer);
       }
     });
   }
@@ -1593,13 +1822,15 @@ async function handleSkill(
   interaction: ChatInputCommandInteraction,
   agentRunner: AgentRunner,
   config: ReturnType<typeof loadConfig>,
-  channelId: string
-) {
+  channelId: string,
+  setThreadState: ThreadStateSetter
+): Promise<string | null> {
   const skillName = interaction.options.getString('name', true);
   const args = interaction.options.getString('args') || '';
   const skipPermissions = config.agent.config.skipPermissions ?? false;
 
   await interaction.deferReply();
+  const threadStatusTimer = startThreadStatusBlueTimer(interaction.channel, setThreadState);
 
   try {
     const prompt = `スキル「${skillName}」を実行してください。${args ? `引数: ${args}` : ''}`;
@@ -1616,9 +1847,15 @@ async function handleSkill(
     for (let i = 1; i < chunks.length; i++) {
       await interaction.followUp(chunks[i]);
     }
+    return result;
   } catch (error) {
+    const thread = getThreadChannel(interaction.channel);
+    if (thread) setThreadState(thread.id, '🟡');
     console.error('[xangi] Error:', error);
     await interaction.editReply('エラーが発生しました');
+    return null;
+  } finally {
+    if (threadStatusTimer) clearTimeout(threadStatusTimer);
   }
 }
 
@@ -1627,12 +1864,14 @@ async function handleSkillCommand(
   agentRunner: AgentRunner,
   config: ReturnType<typeof loadConfig>,
   channelId: string,
-  skillName: string
-) {
+  skillName: string,
+  setThreadState: ThreadStateSetter
+): Promise<string | null> {
   const args = interaction.options.getString('args') || '';
   const skipPermissions = config.agent.config.skipPermissions ?? false;
 
   await interaction.deferReply();
+  const threadStatusTimer = startThreadStatusBlueTimer(interaction.channel, setThreadState);
 
   try {
     const prompt = `スキル「${skillName}」を実行してください。${args ? `引数: ${args}` : ''}`;
@@ -1649,9 +1888,15 @@ async function handleSkillCommand(
     for (let i = 1; i < chunks.length; i++) {
       await interaction.followUp(chunks[i]);
     }
+    return result;
   } catch (error) {
+    const thread = getThreadChannel(interaction.channel);
+    if (thread) setThreadState(thread.id, '🟡');
     console.error('[xangi] Error:', error);
     await interaction.editReply('エラーが発生しました');
+    return null;
+  } finally {
+    if (threadStatusTimer) clearTimeout(threadStatusTimer);
   }
 }
 
@@ -1828,9 +2073,11 @@ async function processPrompt(
   prompt: string,
   skipPermissions: boolean,
   channelId: string,
-  config: ReturnType<typeof loadConfig>
+  config: ReturnType<typeof loadConfig>,
+  setThreadState: ThreadStateSetter
 ): Promise<string | null> {
   let replyMessage: Message | null = null;
+  const threadStatusTimer = startThreadStatusBlueTimer(message.channel, setThreadState);
   try {
     // チャンネル情報をプロンプトに付与
     const channelName =
@@ -1979,6 +2226,8 @@ async function processPrompt(
     // AIの応答を返す（!discord コマンド処理用）
     return result;
   } catch (error) {
+    const thread = getThreadChannel(message.channel);
+    if (thread) setThreadState(thread.id, '🟡');
     if (error instanceof Error && error.message === 'Request cancelled by user') {
       console.log('[xangi] Request cancelled by user');
       await replyMessage?.edit('🛑 停止しました').catch(() => {});
@@ -2041,6 +2290,7 @@ async function processPrompt(
 
     return null;
   } finally {
+    if (threadStatusTimer) clearTimeout(threadStatusTimer);
     // 👀 リアクションを削除
     await message.reactions.cache
       .find((r) => r.emoji.name === '👀')
