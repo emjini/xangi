@@ -33,6 +33,7 @@ import {
   type ScheduleType,
 } from './scheduler.js';
 import { initSessions, getSession, setSession, deleteSession } from './sessions.js';
+import { stripToolCorruption } from './tool-corruption-filter.js';
 import {
   THREAD_STATUS_EMOJIS,
   buildThreadStateName,
@@ -1714,7 +1715,7 @@ async function main() {
         const displayText = filePaths.length > 0 ? stripFilePaths(result) : result;
 
         // 2000文字超の応答は分割送信
-        const textChunks = splitMessage(displayText, DISCORD_SAFE_LENGTH);
+        const textChunks = splitMessage(stripToolCorruption(displayText), DISCORD_SAFE_LENGTH);
         await thinkingMsg.edit(textChunks[0] || '✅');
         // 最後に送信したメッセージIDを記録（スケジューラー経由）
         if ('id' in thinkingMsg) {
@@ -1842,7 +1843,7 @@ async function handleSkill(
     });
 
     setSession(channelId, newSessionId);
-    const chunks = splitMessage(result, DISCORD_SAFE_LENGTH);
+    const chunks = splitMessage(stripToolCorruption(result), DISCORD_SAFE_LENGTH);
     await interaction.editReply(chunks[0] || '✅');
     for (let i = 1; i < chunks.length; i++) {
       await interaction.followUp(chunks[i]);
@@ -1883,7 +1884,7 @@ async function handleSkillCommand(
     });
 
     setSession(channelId, newSessionId);
-    const chunks = splitMessage(result, DISCORD_SAFE_LENGTH);
+    const chunks = splitMessage(stripToolCorruption(result), DISCORD_SAFE_LENGTH);
     await interaction.editReply(chunks[0] || '✅');
     for (let i = 1; i < chunks.length; i++) {
       await interaction.followUp(chunks[i]);
@@ -1997,6 +1998,8 @@ function extractDiscordSendFromPrompt(text: string): {
  * !discord send の複数行メッセージ（続く行）も除去
  */
 function stripCommandsFromDisplay(text: string): string {
+  // Opus 4.8 バグ対策: 破損ツール呼び出しXMLがテキストとして漏れていたら除去
+  text = stripToolCorruption(text);
   const lines = text.split('\n');
   const result: string[] = [];
   let inCodeBlock = false;
@@ -2141,7 +2144,7 @@ async function processPrompt(
                 pendingUpdate = true;
                 lastUpdateTime = now;
                 replyMessage!
-                  .edit((fullText + ' ▌').slice(0, DISCORD_MAX_LENGTH))
+                  .edit((stripToolCorruption(fullText) + ' ▌').slice(0, DISCORD_MAX_LENGTH))
                   .catch((err) => {
                     console.error('[xangi] Failed to edit message:', err.message);
                   })

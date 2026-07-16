@@ -82,6 +82,8 @@ export class ClaudeCodeRunner {
       logResponse(this.workdir, options.channelId, {
         result: response.result,
         sessionId: response.session_id,
+        total_cost_usd: response.total_cost_usd,
+        duration_ms: response.duration_ms,
       });
     }
 

@@ -5,6 +5,7 @@ import { mergeTexts, sanitizeSurrogates } from './agent-runner.js';
 import { DEFAULT_TIMEOUT_MS } from './constants.js';
 import { buildPersistentSystemPrompt } from './base-runner.js';
 import { logPrompt, logResponse, logError } from './transcript-logger.js';
+import { detectToolCorruption, logToolCorruption } from './tool-corruption-filter.js';
 
 /**
  * リクエストキューのアイテム
@@ -32,6 +33,8 @@ export class PersistentRunner extends EventEmitter implements AgentRunner {
   private fullText = '';
   private shuttingDown = false;
   private cancelling = false;
+  // Opus 4.8 バグ対策: このターンで破損ツール呼び出しXMLを検出したか
+  private turnCorrupted = false;
 
   // サーキットブレーカー: 連続クラッシュ対策
   private crashCount = 0;
@@ -238,6 +241,11 @@ export class PersistentRunner extends EventEmitter implements AgentRunner {
       for (const block of json.message.content) {
         if (block.type === 'text' && block.text) {
           this.fullText += block.text;
+          // 破損ツール呼び出しXMLの検出（累積テキストに対して行い、block境界の分割にも対応）
+          if (!this.turnCorrupted && detectToolCorruption(this.fullText)) {
+            this.turnCorrupted = true;
+            console.warn('[persistent-runner] Corrupted tool-call XML detected in text stream');
+          }
           this.currentItem?.callbacks?.onText?.(block.text, this.fullText);
         }
       }
@@ -285,6 +293,7 @@ export class PersistentRunner extends EventEmitter implements AgentRunner {
             this.currentItem = null;
           }
           this.fullText = '';
+          this.turnCorrupted = false;
 
           // cancelling フラグのクリアは close イベントで行われるが、
           // プロセスがまだ死んでいない場合に備えて直接 processNext を呼ぶ
@@ -303,6 +312,10 @@ export class PersistentRunner extends EventEmitter implements AgentRunner {
         // （ツール呼び出し前のテキストが result から消えるのを防ぐ）
         if (json.result) {
           this.fullText = mergeTexts(this.fullText, json.result);
+          if (!this.turnCorrupted && detectToolCorruption(this.fullText)) {
+            this.turnCorrupted = true;
+            console.warn('[persistent-runner] Corrupted tool-call XML detected in final result');
+          }
         }
 
         if (this.currentItem) {
@@ -326,9 +339,56 @@ export class PersistentRunner extends EventEmitter implements AgentRunner {
       this.currentItem = null;
       this.fullText = '';
 
+      // 破損ターンの場合はセッションを破棄してから次を処理（自己強化の防止）
+      const wasCorrupted = this.turnCorrupted;
+      this.turnCorrupted = false;
+      if (wasCorrupted && !json.is_error) {
+        this.handleCorruptedTurn();
+        return;
+      }
+
       // 次のリクエストを処理
       this.processNext();
     }
+  }
+
+  /**
+   * 破損ツール呼び出しXMLを含んだターンの後処理
+   *
+   * 壊れたターンがセッション履歴に残ると同じ破損が繰り返される
+   * (anthropics/claude-code#64658, #67295) ため、応答を返した後に
+   * セッションを破棄し、次のリクエストから新規セッションで応答する。
+   * 処理パターンは resume 失敗時のリカバリと同じ。
+   */
+  private handleCorruptedTurn(): void {
+    console.warn(
+      '[persistent-runner] Turn contained corrupted tool-call XML. Invalidating session to prevent self-reinforcement.'
+    );
+    logToolCorruption(
+      this.workdir ?? process.cwd(),
+      this.channelId ?? 'unknown',
+      `model=${this.model ?? 'default'} session=${this.sessionId ? this.sessionId.slice(0, 8) : 'none'}`
+    );
+
+    const oldSessionId = this.sessionId || this.resumeSessionId;
+    this.sessionId = '';
+    this.resumeSessionId = undefined;
+    this.emit('session-invalidated', this.channelId, oldSessionId);
+
+    // プロセスをkillして次回リクエストは新規セッションで起動
+    if (this.process) {
+      this.cancelling = true;
+      this.process.kill();
+      this.process = null;
+      this.processAlive = false;
+      this.buffer = '';
+    }
+
+    // close イベント処理後に次のリクエストを処理（resume失敗リトライと同じパターン）
+    setTimeout(() => {
+      this.cancelling = false;
+      this.processNext();
+    }, 100);
   }
 
   /**
