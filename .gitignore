@@ -8,6 +8,12 @@ dist/
 config.yaml
 .env
 
+# Backups
+# .env.bak* は DISCORD_TOKEN 等をそのまま含むため、絶対にコミットしない
+.env.bak*
+*.bak
+*.bak.*
+
 # Logs
 *.log
 logs/
