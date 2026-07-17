@@ -1238,7 +1238,8 @@ async function main() {
   async function handleDiscordCommandsInResponse(
     text: string,
     sourceMessage?: Message,
-    fallbackChannelId?: string
+    fallbackChannelId?: string,
+    options?: { applyThreadState?: boolean }
   ): Promise<string[]> {
     const lines = text.split('\n');
     let inCodeBlock = false;
@@ -1431,7 +1432,12 @@ async function main() {
       i++;
     }
 
-    await applyThreadStateFromResponse(text, sourceMessage, fallbackChannelId);
+    // 再注入を伴う経路は applyThreadState:false で抑止し、チェーン全体が終わってから
+    // 呼び出し側が最後に1回だけ適用する。途中で適用すると、再注入ターンが仕掛ける
+    // 新しい青タイマーに🔵で上書きされ、完了後も🔵のまま残る。
+    if (options?.applyThreadState !== false) {
+      await applyThreadStateFromResponse(text, sourceMessage, fallbackChannelId);
+    }
 
     return feedbackResults;
   }
@@ -1581,7 +1587,11 @@ async function main() {
 
       // AIの応答から !discord コマンドを検知して実行
       if (result) {
-        const feedbackResults = await handleDiscordCommandsInResponse(result, message);
+        // スレッド状態は再注入ターンまで含めた全応答が届いてから、最後に1回だけ適用する
+        let finalText = result;
+        const feedbackResults = await handleDiscordCommandsInResponse(result, message, undefined, {
+          applyThreadState: false,
+        });
 
         // フィードバック結果があればエージェントに再注入
         if (feedbackResults.length > 0) {
@@ -1597,10 +1607,16 @@ async function main() {
             setThreadState
           );
           // 再注入後の応答にもコマンドがあれば処理（ただし再帰は1回のみ）
+          // 空応答・エラー時は finalText をターン1のままにして、その文末マーカーを使う
           if (feedbackResult) {
-            await handleDiscordCommandsInResponse(feedbackResult, message);
+            await handleDiscordCommandsInResponse(feedbackResult, message, undefined, {
+              applyThreadState: false,
+            });
+            finalText = feedbackResult;
           }
         }
+
+        await applyThreadStateFromResponse(finalText, message);
       }
     } finally {
       processingChannels.delete(channelId);
@@ -1686,7 +1702,14 @@ async function main() {
         setSession(channelId, newSessionId);
 
         // AI応答内の !discord コマンドを処理（sourceMessage なし、channelIdをフォールバック）
-        const feedbackResults = await handleDiscordCommandsInResponse(result, undefined, channelId);
+        // スレッド状態は再注入ターンまで含めた全応答が終わってから、最後に1回だけ適用する
+        let finalText = result;
+        const feedbackResults = await handleDiscordCommandsInResponse(
+          result,
+          undefined,
+          channelId,
+          { applyThreadState: false }
+        );
 
         // フィードバック結果があればエージェントに再注入
         if (feedbackResults.length > 0) {
@@ -1707,8 +1730,14 @@ async function main() {
           }
           setSession(channelId, feedbackRun.sessionId);
           // 再注入後の応答にもコマンドがあれば処理
-          await handleDiscordCommandsInResponse(feedbackRun.result, undefined, channelId);
+          await handleDiscordCommandsInResponse(feedbackRun.result, undefined, channelId, {
+            applyThreadState: false,
+          });
+          // 空応答時は finalText をターン1のままにして、その文末マーカーを使う
+          if (feedbackRun.result) finalText = feedbackRun.result;
         }
+
+        await applyThreadStateFromResponse(finalText, undefined, channelId);
 
         // 結果を送信
         const filePaths = extractFilePaths(result);
@@ -1834,7 +1863,11 @@ async function handleSkill(
   const threadStatusTimer = startThreadStatusBlueTimer(interaction.channel, setThreadState);
 
   try {
-    const prompt = `スキル「${skillName}」を実行してください。${args ? `引数: ${args}` : ''}`;
+    const prompt = withChannelHeader(
+      interaction.channel,
+      channelId,
+      `スキル「${skillName}」を実行してください。${args ? `引数: ${args}` : ''}`
+    );
     const sessionId = getSession(channelId);
     const { result, sessionId: newSessionId } = await agentRunner.run(prompt, {
       skipPermissions,
@@ -1875,7 +1908,11 @@ async function handleSkillCommand(
   const threadStatusTimer = startThreadStatusBlueTimer(interaction.channel, setThreadState);
 
   try {
-    const prompt = `スキル「${skillName}」を実行してください。${args ? `引数: ${args}` : ''}`;
+    const prompt = withChannelHeader(
+      interaction.channel,
+      channelId,
+      `スキル「${skillName}」を実行してください。${args ? `引数: ${args}` : ''}`
+    );
     const sessionId = getSession(channelId);
     const { result, sessionId: newSessionId } = await agentRunner.run(prompt, {
       skipPermissions,
@@ -2070,6 +2107,23 @@ function stripCommandsFromDisplay(text: string): string {
   return result.join('\n').trim();
 }
 
+/**
+ * プロンプト冒頭にチャンネル情報を付与する。
+ * reply-on/reply-off 等のスキルはこのヘッダーからチャンネルIDを読むため、
+ * 通常メッセージ経路とスラッシュコマンド経路の両方で必ず通すこと。
+ * 名前を持たないチャンネル（DM等）でもIDだけは必ず出す。
+ */
+function withChannelHeader(
+  channel: object | null | undefined,
+  channelId: string,
+  prompt: string
+): string {
+  const channelName =
+    channel && 'name' in channel ? (channel as { name: string | null }).name : null;
+  const label = channelName ? `#${channelName} ` : '';
+  return `[チャンネル: ${label}(ID: ${channelId})]\n${prompt}`;
+}
+
 async function processPrompt(
   message: Message,
   agentRunner: AgentRunner,
@@ -2083,11 +2137,7 @@ async function processPrompt(
   const threadStatusTimer = startThreadStatusBlueTimer(message.channel, setThreadState);
   try {
     // チャンネル情報をプロンプトに付与
-    const channelName =
-      'name' in message.channel ? (message.channel as { name: string }).name : null;
-    if (channelName) {
-      prompt = `[チャンネル: #${channelName} (ID: ${channelId})]\n${prompt}`;
-    }
+    prompt = withChannelHeader(message.channel, channelId, prompt);
 
     console.log(`[xangi] Processing message in channel ${channelId}`);
     await message.react('👀').catch(() => {});
