@@ -23,6 +23,13 @@ import {
   buildPromptWithAttachments,
 } from './file-utils.js';
 import { initSettings, loadSettings, saveSettings, formatSettings } from './settings.js';
+import {
+  addParkedItem,
+  takeParkedItems,
+  commitTake,
+  restoreTake,
+  recoverOrphanedTakes,
+} from './park.js';
 import { DISCORD_MAX_LENGTH, DISCORD_SAFE_LENGTH, STREAM_UPDATE_INTERVAL_MS } from './constants.js';
 import {
   Scheduler,
@@ -50,6 +57,9 @@ const THREAD_STATUS_BLUE_THRESHOLD_MS =
   Number.isFinite(configuredBlueThreshold) && configuredBlueThreshold >= 0
     ? configuredBlueThreshold
     : 60000;
+
+// park拾い上げの1ターンあたり最大サイクル数（無限ループ防止。超過分は次ターンへ繰り越し）
+const MAX_PARK_PICKUP_CYCLES = 5;
 
 function getThreadChannel(channel: unknown): {
   id: string;
@@ -370,6 +380,8 @@ async function main() {
 
   // スケジューラを初期化（ワークスペースの .xangi を使用）
   const dataDir = process.env.DATA_DIR || join(workdir, '.xangi');
+  // 拾い上げ途中でプロセスが落ちて残った park の *.taking を復旧（メモを失わない）
+  recoverOrphanedTakes(dataDir);
   const scheduler = new Scheduler(dataDir);
 
   // セッション永続化を初期化
@@ -1469,6 +1481,29 @@ async function main() {
 
     if (!isMentioned && !isDM && !isAutoReplyChannel) return;
 
+    // !park: 作業中でも受け取れるクイックストック。エージェントを起動せず溜めるだけ。
+    // busyガードより前に処理する（＝処理中でも park できる）。次のターン完了後に自動で拾い上げる。
+    {
+      const parkRaw = message.content.replace(/<@[!&]?\d+>/g, '').trim();
+      if (parkRaw === '!park' || /^!park\s/.test(parkRaw)) {
+        if (!config.discord.allowedUsers?.includes(message.author.id)) return;
+        const body = parkRaw.replace(/^!park\s*/, '').trim();
+        if (!body) {
+          await message.react('❓').catch(() => {});
+          return;
+        }
+        const ts = new Date().toLocaleString('ja-JP', {
+          timeZone: 'Asia/Tokyo',
+          hour: '2-digit',
+          minute: '2-digit',
+        });
+        addParkedItem(dataDir, message.channel.id, body, ts);
+        await message.react('📌').catch(() => {});
+        console.log(`[park] Parked item in channel ${message.channel.id}`);
+        return;
+      }
+    }
+
     // 同じチャンネルで処理中なら無視（メンション時は除く）
     if (!isMentioned && processingChannels.has(message.channel.id)) {
       console.log(`[xangi] Skipping message in busy channel: ${message.channel.id}`);
@@ -1617,6 +1652,41 @@ async function main() {
         }
 
         await applyThreadStateFromResponse(finalText, message);
+      }
+
+      // park拾い: 現在の作業が終わったら、溜まった park メモを別ターン（＝別タイムアウト枠）で
+      // 順に拾い上げて対応する。1ターンに詰め込まないので、ターン超過タイムアウトを防げる。
+      let parkCycles = 0;
+      while (parkCycles < MAX_PARK_PICKUP_CYCLES) {
+        const take = takeParkedItems(dataDir, channelId);
+        if (!take) break;
+        parkCycles++;
+        console.log(`[park] Picking up parked items in channel ${channelId} (cycle ${parkCycles})`);
+        try {
+          const parkPrompt = `【park：作業中に届いた追加メモ】\n直前の作業は完了しています。以下はユーザーが作業中に park（一時保存）した追加の依頼・情報です。内容を確認し、対応が必要なものに取り組んでください。複数あれば順に対応を。\n\n${take.content}`;
+          const parkResult = await processPrompt(
+            message,
+            agentRunner,
+            parkPrompt,
+            skipPermissions,
+            channelId,
+            config,
+            setThreadState
+          );
+          commitTake(take);
+          if (parkResult) {
+            await handleDiscordCommandsInResponse(parkResult, message);
+          }
+        } catch (parkErr) {
+          restoreTake(dataDir, take);
+          console.error('[park] Pickup failed; restored items for next turn:', parkErr);
+          break;
+        }
+      }
+      if (parkCycles >= MAX_PARK_PICKUP_CYCLES) {
+        console.log(
+          `[park] Reached max pickup cycles in channel ${channelId}; remaining items (if any) deferred to next turn`
+        );
       }
     } finally {
       processingChannels.delete(channelId);
