@@ -1,6 +1,16 @@
 import http from 'http';
-import { readdirSync, readFileSync, existsSync } from 'fs';
+import {
+  readdirSync,
+  readFileSync,
+  existsSync,
+  statSync,
+  openSync,
+  readSync,
+  closeSync,
+  fstatSync,
+} from 'fs';
 import { join } from 'path';
+import { homedir } from 'os';
 
 /**
  * /status エンドポイント: 「今セッションが動いてるか・サブエージェント(claudeプロセス)が動いてるか」
@@ -88,6 +98,153 @@ function scanClaudeProcesses(): Array<{ pid: number; session: string; etimeSec: 
   return out.sort((a, b) => b.etimeSec - a.etimeSec);
 }
 
+/** ファイル末尾の bytes だけを読む（巨大 jsonl を全読みしない） */
+function readTail(path: string, bytes: number): string {
+  const fd = openSync(path, 'r');
+  try {
+    const size = fstatSync(fd).size;
+    const start = Math.max(0, size - bytes);
+    const len = size - start;
+    if (len <= 0) return '';
+    const buf = Buffer.alloc(len);
+    readSync(fd, buf, 0, len, start);
+    return buf.toString('utf-8');
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/** サブエージェントの jsonl 末尾から「今何をしているか」（最新の tool_use / text）を1つ拾う */
+function readSubagentLatest(jsonlPath: string): { text: string; kind: string } {
+  let tail: string;
+  try {
+    tail = readTail(jsonlPath, 32768);
+  } catch {
+    return { text: '(ログ読取失敗)', kind: 'unknown' };
+  }
+  const lines = tail.split('\n').filter((l) => l.trim());
+  for (let i = lines.length - 1; i >= 0; i--) {
+    let j: { type?: string; message?: { content?: Array<Record<string, unknown>> } };
+    try {
+      j = JSON.parse(lines[i]);
+    } catch {
+      continue; // tail 先頭の切れた行などはスキップ
+    }
+    if (j.type === 'assistant' && Array.isArray(j.message?.content)) {
+      const blocks = j.message.content;
+      for (let k = blocks.length - 1; k >= 0; k--) {
+        const b = blocks[k];
+        if (b.type === 'tool_use') {
+          return { text: `${b.name}(${JSON.stringify(b.input ?? {}).slice(0, 80)})`, kind: 'tool' };
+        }
+        if (b.type === 'text' && typeof b.text === 'string' && b.text.trim()) {
+          return { text: b.text.replace(/\s+/g, ' ').trim().slice(-140), kind: 'text' };
+        }
+      }
+    }
+  }
+  return { text: '(最新活動を特定できず)', kind: 'unknown' };
+}
+
+interface SubagentInfo {
+  agentType: string;
+  task: string;
+  session: string;
+  ageSec: number;
+  latest: string;
+  latestKind: string;
+}
+interface SubagentScan {
+  ok: boolean;
+  error?: string;
+  items: SubagentInfo[];
+}
+
+/**
+ * Claude harness の subagents/*.meta.json + jsonl を走査して稼働中サブエージェントを拾う（Tier-2・best-effort）。
+ * ⚠️ 内部フォーマット依存。読めない/スキーマが変わった場合は ok:false で「要修正」を明示（空白にしない）。
+ */
+function scanSubagents(activeSec = 90): SubagentScan {
+  const base = join(homedir(), '.claude', 'projects');
+  if (!existsSync(base)) {
+    return {
+      ok: false,
+      error: `projects dir が見つからない: ${base}（Claude Codeの構成変更の可能性）`,
+      items: [],
+    };
+  }
+  const items: SubagentInfo[] = [];
+  const now = Date.now();
+  try {
+    for (const proj of readdirSync(base)) {
+      let sessions: string[];
+      try {
+        sessions = readdirSync(join(base, proj));
+      } catch {
+        continue;
+      }
+      for (const sess of sessions) {
+        const subDir = join(base, proj, sess, 'subagents');
+        if (!existsSync(subDir)) continue;
+        let files: string[];
+        try {
+          files = readdirSync(subDir);
+        } catch {
+          continue;
+        }
+        for (const f of files) {
+          if (!f.endsWith('.meta.json')) continue;
+          const metaPath = join(subDir, f);
+          const jsonlPath = metaPath.replace(/\.meta\.json$/, '.jsonl');
+          let freshest: number;
+          try {
+            const mm = statSync(metaPath).mtimeMs;
+            let jm = mm;
+            try {
+              jm = statSync(jsonlPath).mtimeMs;
+            } catch {
+              /* jsonl 無ければ meta の mtime を使う */
+            }
+            freshest = Math.max(mm, jm);
+          } catch {
+            continue;
+          }
+          if (now - freshest > activeSec * 1000) continue; // 古い＝非アクティブはスキップ
+          let meta: { agentType?: unknown; description?: unknown };
+          try {
+            meta = JSON.parse(readFileSync(metaPath, 'utf-8'));
+          } catch {
+            return {
+              ok: false,
+              error: `meta.json のparse失敗 (${f})＝フォーマット変更の可能性。要修正`,
+              items,
+            };
+          }
+          if (typeof meta.agentType !== 'string') {
+            return {
+              ok: false,
+              error: `meta.json に agentType が無い (${f})＝スキーマ変更の可能性。要修正`,
+              items,
+            };
+          }
+          const latest = readSubagentLatest(jsonlPath);
+          items.push({
+            agentType: meta.agentType,
+            task: typeof meta.description === 'string' ? meta.description : '',
+            session: sess.slice(0, 8),
+            ageSec: Math.round((now - freshest) / 1000),
+            latest: latest.text,
+            latestKind: latest.kind,
+          });
+        }
+      }
+    }
+  } catch (e) {
+    return { ok: false, error: `サブエージェント走査中に例外: ${String(e)}。要修正`, items };
+  }
+  return { ok: true, items: items.sort((a, b) => a.ageSec - b.ageSec) };
+}
+
 /** スナップショットを組み立てる */
 function buildSnapshot(getCore: () => CoreStatus) {
   const core = getCore();
@@ -105,6 +262,7 @@ function buildSnapshot(getCore: () => CoreStatus) {
     processingChannels: core.processingChannels,
     stuckChannels,
     activity: core.activity,
+    subagents: scanSubagents(),
     runners: core.runners,
     parked: scanParked(core.dataDir),
     claudeProcesses: scanClaudeProcesses(),
@@ -130,6 +288,7 @@ h1{font-size:16px;margin:0 0 4px} .sub{color:#8a93a2;font-size:12px;margin-botto
 <div class="card"><h2>取り残しロック（要注意）</h2><div id="stuck"></div></div>
 <div class="card"><h2>各チャンネルの今の作業</h2><div id="activity"></div></div>
 <div class="card"><h2>処理中チャンネル（ターン実行中）</h2><div id="proc"></div></div>
+<div class="card"><h2>サブエージェント（harness内部・best-effort）</h2><div id="subagents"></div></div>
 <div class="card"><h2>稼働 claude プロセス（セッション/サブエージェント）</h2><div id="procs"></div></div>
 <div class="card"><h2>ランナー・プール</h2><div id="runners"></div></div>
 <div class="card"><h2>park 未処理</h2><div id="parked"></div></div>
@@ -143,6 +302,9 @@ async function tick(){
   $('stuck').innerHTML=s.stuckChannels.length?s.stuckChannels.map(c=>'<div class="row"><span class="mono">'+esc(c)+'</span><span class="pill stuck">STUCK?</span></div>').join(''):'<div class="empty">なし</div>';
   $('activity').innerHTML=(s.activity&&s.activity.length)?s.activity.map(a=>'<div class="row"><span><span class="mono">'+esc(a.channelId)+'</span><br><span style="color:#c9d1d9">'+esc(a.request||'(実行中)')+'</span>'+(a.latestText?'<br><span style="color:#8a93a2;font-size:12px">💬 '+esc(a.latestText)+(a.latestAgoSec>=0?' ('+a.latestAgoSec+'s前)':'')+'</span>':'')+'</span><span class="pill on">'+a.elapsedSec+'s</span></div>').join(''):'<div class="empty">アイドル</div>';
   $('proc').innerHTML=s.processingChannels.length?s.processingChannels.map(c=>'<div class="row"><span class="mono">'+esc(c)+'</span><span class="pill on">実行中</span></div>').join(''):'<div class="empty">アイドル</div>';
+  if(s.subagents && s.subagents.ok===false){ $('subagents').innerHTML='<div class="row"><span style="color:#f87171">⚠️ 取得失敗（要修正）: '+esc(s.subagents.error||'')+'</span><span class="pill stuck">BROKEN</span></div>'; }
+  else if(s.subagents && s.subagents.items.length){ $('subagents').innerHTML=s.subagents.items.map(a=>'<div class="row"><span><span class="pill on">'+esc(a.agentType)+'</span> <span style="color:#c9d1d9">'+esc(a.task||'')+'</span><br><span style="color:#8a93a2;font-size:12px">'+(a.latestKind==='tool'?'🔧 ':'💬 ')+esc(a.latest)+' · '+esc(a.session)+'</span></span><span class="pill on">'+a.ageSec+'s前</span></div>').join(''); }
+  else { $('subagents').innerHTML='<div class="empty">なし（稼働中サブエージェント無し）</div>'; }
   $('procs').innerHTML=s.claudeProcesses.length?s.claudeProcesses.map(p=>'<div class="row"><span class="mono">pid '+p.pid+' · '+esc(p.session)+'</span><span class="pill on">'+p.etimeSec+'s</span></div>').join(''):'<div class="empty">なし</div>';
   $('runners').innerHTML=s.runners.length?s.runners.map(r=>'<div class="row"><span class="mono">'+esc(r.channelId)+(r.alive?'':' ☠dead')+'</span><span class="pill '+(!r.alive?'stuck':(r.idleSeconds>120?'idle':'on'))+'">idle '+r.idleSeconds+'s</span></div>').join(''):'<div class="empty">なし</div>';
   $('parked').innerHTML=s.parked.length?s.parked.map(p=>'<div class="row"><span class="mono">'+esc(p.channelId)+'</span><span class="pill idle">'+p.count+'件</span></div>').join(''):'<div class="empty">なし</div>';
