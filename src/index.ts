@@ -162,6 +162,25 @@ function getTypeLabel(
 // チャンネルごとの最後に送信したボットメッセージID
 const lastSentMessageIds = new Map<string, string>();
 
+// チャンネルごとの「今何をしているか」（/status 可視化用）。processPrompt 開始でセット・完了で delete。
+interface ChannelActivity {
+  startedAt: number;
+  request: string; // Lv1: 処理中の依頼の要約
+  latestText: string; // Lv2: 直近のストリーミング出力
+  latestTextAt: number;
+}
+const channelActivity = new Map<string, ChannelActivity>();
+
+/** processPrompt に渡る prompt から、/status 表示用に依頼の要約を切り出す */
+function activityRequestSnippet(prompt: string): string {
+  return prompt
+    .replace(/^\[現在時刻:[^\]]*\]\s*/, '') // 先頭の時刻注入を除去
+    .split('\n\n[')[0] // 末尾の [添付ファイル]/[チャンネルルール] ブロック手前まで
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 140);
+}
+
 async function main() {
   const config = loadConfig();
 
@@ -1469,6 +1488,13 @@ async function main() {
     startStatusServer(statusPort, () => ({
       processingChannels: [...processingChannels],
       runners: agentRunner instanceof RunnerManager ? agentRunner.getStatus().channels : [],
+      activity: [...channelActivity.entries()].map(([ch, a]) => ({
+        channelId: ch,
+        elapsedSec: Math.round((Date.now() - a.startedAt) / 1000),
+        request: a.request,
+        latestText: a.latestText,
+        latestAgoSec: a.latestTextAt ? Math.round((Date.now() - a.latestTextAt) / 1000) : -1,
+      })),
       dataDir,
     }));
   }
@@ -2241,6 +2267,12 @@ async function processPrompt(
 ): Promise<string | null> {
   let replyMessage: Message | null = null;
   const threadStatusTimer = startThreadStatusBlueTimer(message.channel, setThreadState);
+  channelActivity.set(channelId, {
+    startedAt: Date.now(),
+    request: activityRequestSnippet(prompt),
+    latestText: '',
+    latestTextAt: 0,
+  });
   try {
     // チャンネル情報をプロンプトに付与
     prompt = withChannelHeader(message.channel, channelId, prompt);
@@ -2294,6 +2326,11 @@ async function processPrompt(
               if (!firstTextReceived) {
                 firstTextReceived = true;
                 clearInterval(thinkingInterval);
+              }
+              const act = channelActivity.get(channelId);
+              if (act) {
+                act.latestText = fullText.replace(/\s+/g, ' ').trim().slice(-160);
+                act.latestTextAt = Date.now();
               }
               const now = Date.now();
               if (now - lastUpdateTime >= STREAM_UPDATE_INTERVAL_MS && !pendingUpdate) {
@@ -2450,6 +2487,7 @@ async function processPrompt(
     return null;
   } finally {
     if (threadStatusTimer) clearTimeout(threadStatusTimer);
+    channelActivity.delete(channelId);
     // 👀 リアクションを削除
     await message.reactions.cache
       .find((r) => r.emoji.name === '👀')

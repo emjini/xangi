@@ -11,6 +11,13 @@ import { join } from 'path';
 export interface CoreStatus {
   processingChannels: string[];
   runners: Array<{ channelId: string; idleSeconds: number; alive: boolean }>;
+  activity: Array<{
+    channelId: string;
+    elapsedSec: number;
+    request: string;
+    latestText: string;
+    latestAgoSec: number;
+  }>;
   dataDir: string;
 }
 
@@ -97,6 +104,7 @@ function buildSnapshot(getCore: () => CoreStatus) {
     memoryMB: Math.round(process.memoryUsage().rss / 1024 / 1024),
     processingChannels: core.processingChannels,
     stuckChannels,
+    activity: core.activity,
     runners: core.runners,
     parked: scanParked(core.dataDir),
     claudeProcesses: scanClaudeProcesses(),
@@ -120,6 +128,7 @@ h1{font-size:16px;margin:0 0 4px} .sub{color:#8a93a2;font-size:12px;margin-botto
 </style></head><body>
 <h1>🛰 xangi status</h1><div class="sub" id="meta">読み込み中…</div>
 <div class="card"><h2>取り残しロック（要注意）</h2><div id="stuck"></div></div>
+<div class="card"><h2>各チャンネルの今の作業</h2><div id="activity"></div></div>
 <div class="card"><h2>処理中チャンネル（ターン実行中）</h2><div id="proc"></div></div>
 <div class="card"><h2>稼働 claude プロセス（セッション/サブエージェント）</h2><div id="procs"></div></div>
 <div class="card"><h2>ランナー・プール</h2><div id="runners"></div></div>
@@ -132,6 +141,7 @@ async function tick(){
   const s=await(await fetch('/status.json',{cache:'no-store'})).json();
   $('meta').textContent='pid '+s.pid+' · uptime '+s.uptimeSec+'s · mem '+s.memoryMB+'MB · '+new Date(s.now).toLocaleTimeString('ja-JP');
   $('stuck').innerHTML=s.stuckChannels.length?s.stuckChannels.map(c=>'<div class="row"><span class="mono">'+esc(c)+'</span><span class="pill stuck">STUCK?</span></div>').join(''):'<div class="empty">なし</div>';
+  $('activity').innerHTML=(s.activity&&s.activity.length)?s.activity.map(a=>'<div class="row"><span><span class="mono">'+esc(a.channelId)+'</span><br><span style="color:#c9d1d9">'+esc(a.request||'(実行中)')+'</span>'+(a.latestText?'<br><span style="color:#8a93a2;font-size:12px">💬 '+esc(a.latestText)+(a.latestAgoSec>=0?' ('+a.latestAgoSec+'s前)':'')+'</span>':'')+'</span><span class="pill on">'+a.elapsedSec+'s</span></div>').join(''):'<div class="empty">アイドル</div>';
   $('proc').innerHTML=s.processingChannels.length?s.processingChannels.map(c=>'<div class="row"><span class="mono">'+esc(c)+'</span><span class="pill on">実行中</span></div>').join(''):'<div class="empty">アイドル</div>';
   $('procs').innerHTML=s.claudeProcesses.length?s.claudeProcesses.map(p=>'<div class="row"><span class="mono">pid '+p.pid+' · '+esc(p.session)+'</span><span class="pill on">'+p.etimeSec+'s</span></div>').join(''):'<div class="empty">なし</div>';
   $('runners').innerHTML=s.runners.length?s.runners.map(r=>'<div class="row"><span class="mono">'+esc(r.channelId)+(r.alive?'':' ☠dead')+'</span><span class="pill '+(!r.alive?'stuck':(r.idleSeconds>120?'idle':'on'))+'">idle '+r.idleSeconds+'s</span></div>').join(''):'<div class="empty">なし</div>';
