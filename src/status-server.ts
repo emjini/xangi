@@ -376,7 +376,9 @@ const STATUS_HTML = `<!doctype html><html lang="ja"><head><meta charset="utf-8">
 <style>
 body{background:#0f1115;color:#e6e6e6;font:14px/1.5 system-ui,sans-serif;margin:0;padding:16px}
 h1{font-size:16px;margin:0 0 4px} .sub{color:#8a93a2;font-size:12px;margin-bottom:14px}
-.card{background:#171a21;border:1px solid #232833;border-radius:10px;padding:12px 14px;margin-bottom:12px}
+/* 2カラム（幅が足りない端末では自動で1カラムに戻る） */
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:12px;align-items:start}
+.card{background:#171a21;border:1px solid #232833;border-radius:10px;padding:12px 14px;margin:0}
 .card h2{font-size:13px;margin:0 0 8px;color:#a9b2c0;text-transform:uppercase;letter-spacing:.04em}
 .row{display:flex;justify-content:space-between;gap:12px;padding:3px 0;border-bottom:1px solid #1e232d}
 .row:last-child{border-bottom:0} .mono{font-family:ui-monospace,monospace}
@@ -385,12 +387,14 @@ h1{font-size:16px;margin:0 0 4px} .sub{color:#8a93a2;font-size:12px;margin-botto
 .empty{color:#6b7280;font-style:italic}
 </style></head><body>
 <h1>🛰 xangi status</h1><div class="sub" id="meta">読み込み中…</div>
-<div class="card"><h2>取り残しロック（要注意）</h2><div id="stuck"></div></div>
+<div class="grid">
 <div class="card"><h2>各チャンネルの今の作業</h2><div id="activity"></div></div>
-<div class="card"><h2>サブエージェント（harness内部・best-effort）</h2><div id="subagents"></div></div>
 <div class="card"><h2>稼働 claude プロセス（セッション/サブエージェント）</h2><div id="procs"></div></div>
+<div class="card"><h2>サブエージェント（harness内部・best-effort）</h2><div id="subagents"></div></div>
+<div class="card"><h2>取り残しロック（要注意）</h2><div id="stuck"></div></div>
 <div class="card"><h2>ランナー・プール</h2><div id="runners"></div></div>
 <div class="card"><h2>park 未処理</h2><div id="parked"></div></div>
+</div>
 <script>
 const $=id=>document.getElementById(id);
 const esc=s=>String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
