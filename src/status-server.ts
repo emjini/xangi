@@ -58,9 +58,27 @@ function scanParked(dataDir: string): Array<{ channelId: string; count: number }
   return out;
 }
 
-/** /proc を走査して稼働中の headless claude プロセス（セッション本体＋別プロセス化したサブエージェント）を拾う */
-function scanClaudeProcesses(): Array<{ pid: number; session: string; etimeSec: number }> {
-  const out: Array<{ pid: number; session: string; etimeSec: number }> = [];
+interface ClaudeProc {
+  pid: number;
+  ppid: number;
+  sessionId: string; // --resume の完全なID（無ければ ''）
+  agentFlag: string; // --agent <name>（CLI経由のサブエージェント。無ければ ''）
+  etimeSec: number;
+}
+
+/** 任意PIDの親PIDを /proc から引く（claude以外も辿るため） */
+function getPpid(pid: number): number {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf-8');
+    return Number(stat.slice(stat.lastIndexOf(')') + 2).split(' ')[1]) || 0;
+  } catch {
+    return 0;
+  }
+}
+
+/** /proc を走査して稼働中の headless claude プロセスを拾う（ppidでセッション/サブエージェントを判別する） */
+function scanClaudeProcesses(): ClaudeProc[] {
+  const out: ClaudeProc[] = [];
   let pids: string[];
   try {
     pids = readdirSync('/proc').filter((f) => /^\d+$/.test(f));
@@ -84,21 +102,23 @@ function scanClaudeProcesses(): Array<{ pid: number; session: string; etimeSec: 
     const isClaude = exe === 'claude' || exe.endsWith('/claude');
     if (!isClaude || !args.includes('-p')) continue; // headless(-p) の claude のみ
     const rIdx = args.indexOf('--resume');
-    const session = rIdx >= 0 && args[rIdx + 1] ? args[rIdx + 1].slice(0, 8) : '(new)';
+    const sessionId = rIdx >= 0 && args[rIdx + 1] ? args[rIdx + 1] : '';
+    const aIdx = args.indexOf('--agent');
+    const agentFlag = aIdx >= 0 && args[aIdx + 1] ? args[aIdx + 1] : '';
     let etimeSec = 0;
-    if (sysUptime > 0) {
-      try {
-        const stat = readFileSync(`/proc/${pid}/stat`, 'utf-8');
-        // "pid (comm) state ..." の comm は空白/括弧を含みうるので最後の ')' 以降を使う
-        const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
-        const startTicks = Number(fields[19]); // starttime（clock ticks, sysconf(_SC_CLK_TCK)=100想定）
-        if (Number.isFinite(startTicks))
-          etimeSec = Math.max(0, Math.round(sysUptime - startTicks / 100));
-      } catch {
-        /* stat 読めなければ 0 */
-      }
+    let ppid = 0;
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, 'utf-8');
+      // "pid (comm) state ppid ..." の comm は空白/括弧を含みうるので最後の ')' 以降を使う
+      const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+      ppid = Number(fields[1]) || 0; // 親PID（親も claude なら＝サブエージェント）
+      const startTicks = Number(fields[19]); // starttime（clock ticks, sysconf(_SC_CLK_TCK)=100想定）
+      if (sysUptime > 0 && Number.isFinite(startTicks))
+        etimeSec = Math.max(0, Math.round(sysUptime - startTicks / 100));
+    } catch {
+      /* stat 読めなければ 0 のまま */
     }
-    out.push({ pid: Number(pid), session, etimeSec });
+    out.push({ pid: Number(pid), ppid, sessionId, agentFlag, etimeSec });
   }
   return out.sort((a, b) => b.etimeSec - a.etimeSec);
 }
@@ -154,10 +174,28 @@ function readSubagentLatest(jsonlPath: string): { text: string; kind: string } {
 interface SubagentInfo {
   agentType: string;
   task: string;
-  session: string;
+  parentSession: string; // 親セッションの完全ID（プロセスとの突合に使う）
+  session: string; // 表示用の短縮
   ageSec: number;
   latest: string;
   latestKind: string;
+}
+
+/** sessions.json（channelId → sessionId）から sessionId → channelId の逆引きを作る */
+function readSessionChannelMap(dataDir: string): Map<string, string> {
+  const m = new Map<string, string>();
+  try {
+    const obj = JSON.parse(readFileSync(join(dataDir, 'sessions.json'), 'utf-8')) as Record<
+      string,
+      unknown
+    >;
+    for (const [channelId, sessionId] of Object.entries(obj)) {
+      if (typeof sessionId === 'string') m.set(sessionId, channelId);
+    }
+  } catch {
+    /* 無い/壊れている場合は空（プロセスは所属不明として表示されるだけ） */
+  }
+  return m;
 }
 interface SubagentScan {
   ok: boolean;
@@ -236,6 +274,7 @@ function scanSubagents(activeSec = 90): SubagentScan {
           items.push({
             agentType: meta.agentType,
             task: typeof meta.description === 'string' ? meta.description : '',
+            parentSession: sess,
             session: sess.slice(0, 8),
             ageSec: Math.round((now - freshest) / 1000),
             latest: latest.text,
@@ -261,6 +300,52 @@ function buildSnapshot(getCore: () => CoreStatus, resolveName: ChannelNameResolv
       return id;
     }
   };
+  // 稼働claudeプロセスに「どのチャンネルのエミか／どのサブエージェントか」を付与する
+  const sessionToChannel = readSessionChannelMap(core.dataDir);
+  const procs = scanClaudeProcesses();
+  const byPid = new Map(procs.map((p) => [p.pid, p]));
+  const subs = scanSubagents();
+  /**
+   * 所属チャンネルを解決。自分の --resume が引けなければ、claude以外（sh等）も含めて
+   * 親を最大6段辿り、途中の claude セッションプロセスからチャンネルを推定する。
+   * 親が init に再parentされた（デタッチ済み）場合は解決不能＝所属不明。
+   */
+  const ownerChannel = (p: ClaudeProc): string | undefined => {
+    const direct = p.sessionId ? sessionToChannel.get(p.sessionId) : undefined;
+    if (direct) return direct;
+    let cur = p.ppid;
+    for (let i = 0; i < 6 && cur > 1; i++) {
+      const cp = byPid.get(cur);
+      const ch = cp?.sessionId ? sessionToChannel.get(cp.sessionId) : undefined;
+      if (ch) return ch;
+      cur = getPpid(cur);
+    }
+    return undefined;
+  };
+  const claudeProcesses = procs.map((p) => {
+    // --agent 付き＝CLI経由のサブエージェント／親がclaude＝Agentツール経由のサブエージェント
+    const isSub = !!p.agentFlag || byPid.has(p.ppid);
+    const ch = ownerChannel(p);
+    let agentType: string | undefined = p.agentFlag || undefined;
+    // Agentツール経由は名前が引数に出ないので、親セッション配下の稼働中metaが1つだけなら特定できる
+    if (!agentType && byPid.has(p.ppid) && subs.ok) {
+      const parentSession = byPid.get(p.ppid)?.sessionId;
+      const cands = parentSession
+        ? subs.items.filter((s) => s.parentSession === parentSession)
+        : [];
+      if (cands.length === 1) agentType = cands[0].agentType;
+    }
+    return {
+      pid: p.pid,
+      parentPid: isSub ? p.ppid : undefined,
+      role: isSub ? 'subagent' : p.sessionId ? 'session' : 'oneshot',
+      agentType,
+      channelId: ch,
+      channelName: ch ? nm(ch) : undefined,
+      session: p.sessionId ? p.sessionId.slice(0, 8) : '(new)',
+      etimeSec: p.etimeSec,
+    };
+  });
   const runnerByChannel = new Map(core.runners.map((r) => [r.channelId, r]));
   // busy（ターン実行中）なのに runner が居ない/死んでる/長時間アイドル ＝ 取り残しロックの疑い
   const stuckChannels = core.processingChannels
@@ -277,10 +362,10 @@ function buildSnapshot(getCore: () => CoreStatus, resolveName: ChannelNameResolv
     processingChannels: core.processingChannels, // 生データ（プログラム用。UIは activity に統合済）
     stuckChannels,
     activity: core.activity.map((a) => ({ ...a, channelName: nm(a.channelId) })),
-    subagents: scanSubagents(),
+    subagents: subs,
     runners: core.runners.map((r) => ({ ...r, channelName: nm(r.channelId) })),
     parked: scanParked(core.dataDir).map((p) => ({ ...p, channelName: nm(p.channelId) })),
-    claudeProcesses: scanClaudeProcesses(),
+    claudeProcesses,
   };
 }
 
@@ -318,7 +403,13 @@ async function tick(){
   if(s.subagents && s.subagents.ok===false){ $('subagents').innerHTML='<div class="row"><span style="color:#f87171">⚠️ 取得失敗（要修正）: '+esc(s.subagents.error||'')+'</span><span class="pill stuck">BROKEN</span></div>'; }
   else if(s.subagents && s.subagents.items.length){ $('subagents').innerHTML=s.subagents.items.map(a=>'<div class="row"><span><span class="pill on">'+esc(a.agentType)+'</span> <span style="color:#c9d1d9">'+esc(a.task||'')+'</span><br><span style="color:#8a93a2;font-size:12px">'+(a.latestKind==='tool'?'🔧 ':'💬 ')+esc(a.latest)+' · '+esc(a.session)+'</span></span><span class="pill on">'+a.ageSec+'s前</span></div>').join(''); }
   else { $('subagents').innerHTML='<div class="empty">なし（稼働中サブエージェント無し）</div>'; }
-  $('procs').innerHTML=s.claudeProcesses.length?s.claudeProcesses.map(p=>'<div class="row"><span class="mono">pid '+p.pid+' · '+esc(p.session)+'</span><span class="pill on">'+p.etimeSec+'s</span></div>').join(''):'<div class="empty">なし</div>';
+  $('procs').innerHTML=s.claudeProcesses.length?s.claudeProcesses.map(p=>{
+    var who = p.role==='subagent' ? (esc(p.channelName||'所属不明')+' の<b>'+esc(p.agentType||'サブエージェント')+'</b>')
+            : p.role==='session' ? (esc(p.channelName||p.session)+' のセッション')
+            : '単発実行（'+esc(p.channelName||'所属不明')+'）';
+    var sub = 'pid '+p.pid+(p.parentPid?' ← 親 '+p.parentPid:'')+' · '+esc(p.session);
+    return '<div class="row"><span>'+who+'<br><span class="mono" style="color:#8a93a2;font-size:12px">'+sub+'</span></span><span class="pill '+(p.role==='subagent'?'idle':'on')+'">'+p.etimeSec+'s</span></div>';
+  }).join(''):'<div class="empty">なし</div>';
   $('runners').innerHTML=s.runners.length?s.runners.map(r=>'<div class="row"><span>'+esc(r.channelName||r.channelId)+(r.alive?'':' ☠dead')+'</span><span class="pill '+(!r.alive?'stuck':(r.idleSeconds>120?'idle':'on'))+'">idle '+r.idleSeconds+'s</span></div>').join(''):'<div class="empty">なし</div>';
   $('parked').innerHTML=s.parked.length?s.parked.map(p=>'<div class="row"><span>'+esc(p.channelName||p.channelId)+'</span><span class="pill idle">'+p.count+'件</span></div>').join(''):'<div class="empty">なし</div>';
  }catch(e){ $('meta').textContent='取得失敗: '+e; }
