@@ -21,8 +21,10 @@ import { homedir } from 'os';
 export interface CoreStatus {
   processingChannels: string[];
   runners: Array<{ channelId: string; idleSeconds: number; alive: boolean }>;
+  /** 「今の作業」。processingChannels との和集合（activity未設定でもbusyなら processing:true で載る） */
   activity: Array<{
     channelId: string;
+    processing: boolean;
     elapsedSec: number;
     request: string;
     latestText: string;
@@ -30,6 +32,9 @@ export interface CoreStatus {
   }>;
   dataDir: string;
 }
+
+/** チャンネルID → Discordのチャンネル名（解決できなければIDのまま返す） */
+export type ChannelNameResolver = (channelId: string) => string;
 
 /** アイドルこの秒数を超えた runner を抱えたまま busy なら「取り残しロック」と見なす閾値 */
 const STUCK_IDLE_SEC = 120;
@@ -246,25 +251,35 @@ function scanSubagents(activeSec = 90): SubagentScan {
 }
 
 /** スナップショットを組み立てる */
-function buildSnapshot(getCore: () => CoreStatus) {
+function buildSnapshot(getCore: () => CoreStatus, resolveName: ChannelNameResolver) {
   const core = getCore();
+  // 名前解決は失敗してもIDにフォールバック（ダッシュボードを壊さない）
+  const nm = (id: string): string => {
+    try {
+      return resolveName(id) || id;
+    } catch {
+      return id;
+    }
+  };
   const runnerByChannel = new Map(core.runners.map((r) => [r.channelId, r]));
   // busy（ターン実行中）なのに runner が居ない/死んでる/長時間アイドル ＝ 取り残しロックの疑い
-  const stuckChannels = core.processingChannels.filter((ch) => {
-    const r = runnerByChannel.get(ch);
-    return !r || !r.alive || r.idleSeconds > STUCK_IDLE_SEC;
-  });
+  const stuckChannels = core.processingChannels
+    .filter((ch) => {
+      const r = runnerByChannel.get(ch);
+      return !r || !r.alive || r.idleSeconds > STUCK_IDLE_SEC;
+    })
+    .map((ch) => ({ channelId: ch, channelName: nm(ch) }));
   return {
     now: new Date().toISOString(),
     uptimeSec: Math.round(process.uptime()),
     pid: process.pid,
     memoryMB: Math.round(process.memoryUsage().rss / 1024 / 1024),
-    processingChannels: core.processingChannels,
+    processingChannels: core.processingChannels, // 生データ（プログラム用。UIは activity に統合済）
     stuckChannels,
-    activity: core.activity,
+    activity: core.activity.map((a) => ({ ...a, channelName: nm(a.channelId) })),
     subagents: scanSubagents(),
-    runners: core.runners,
-    parked: scanParked(core.dataDir),
+    runners: core.runners.map((r) => ({ ...r, channelName: nm(r.channelId) })),
+    parked: scanParked(core.dataDir).map((p) => ({ ...p, channelName: nm(p.channelId) })),
     claudeProcesses: scanClaudeProcesses(),
   };
 }
@@ -287,7 +302,6 @@ h1{font-size:16px;margin:0 0 4px} .sub{color:#8a93a2;font-size:12px;margin-botto
 <h1>🛰 xangi status</h1><div class="sub" id="meta">読み込み中…</div>
 <div class="card"><h2>取り残しロック（要注意）</h2><div id="stuck"></div></div>
 <div class="card"><h2>各チャンネルの今の作業</h2><div id="activity"></div></div>
-<div class="card"><h2>処理中チャンネル（ターン実行中）</h2><div id="proc"></div></div>
 <div class="card"><h2>サブエージェント（harness内部・best-effort）</h2><div id="subagents"></div></div>
 <div class="card"><h2>稼働 claude プロセス（セッション/サブエージェント）</h2><div id="procs"></div></div>
 <div class="card"><h2>ランナー・プール</h2><div id="runners"></div></div>
@@ -299,22 +313,25 @@ async function tick(){
  try{
   const s=await(await fetch('/status.json',{cache:'no-store'})).json();
   $('meta').textContent='pid '+s.pid+' · uptime '+s.uptimeSec+'s · mem '+s.memoryMB+'MB · '+new Date(s.now).toLocaleTimeString('ja-JP');
-  $('stuck').innerHTML=s.stuckChannels.length?s.stuckChannels.map(c=>'<div class="row"><span class="mono">'+esc(c)+'</span><span class="pill stuck">STUCK?</span></div>').join(''):'<div class="empty">なし</div>';
-  $('activity').innerHTML=(s.activity&&s.activity.length)?s.activity.map(a=>'<div class="row"><span><span class="mono">'+esc(a.channelId)+'</span><br><span style="color:#c9d1d9">'+esc(a.request||'(実行中)')+'</span>'+(a.latestText?'<br><span style="color:#8a93a2;font-size:12px">💬 '+esc(a.latestText)+(a.latestAgoSec>=0?' ('+a.latestAgoSec+'s前)':'')+'</span>':'')+'</span><span class="pill on">'+a.elapsedSec+'s</span></div>').join(''):'<div class="empty">アイドル</div>';
-  $('proc').innerHTML=s.processingChannels.length?s.processingChannels.map(c=>'<div class="row"><span class="mono">'+esc(c)+'</span><span class="pill on">実行中</span></div>').join(''):'<div class="empty">アイドル</div>';
+  $('stuck').innerHTML=s.stuckChannels.length?s.stuckChannels.map(c=>'<div class="row"><span>'+esc(c.channelName||c.channelId)+'</span><span class="pill stuck">STUCK?</span></div>').join(''):'<div class="empty">なし</div>';
+  $('activity').innerHTML=(s.activity&&s.activity.length)?s.activity.map(a=>'<div class="row"><span><b>'+esc(a.channelName||a.channelId)+'</b>'+(a.processing?' <span class="pill on">処理中</span>':'')+'<br><span style="color:#c9d1d9">'+esc(a.request||'(準備中)')+'</span>'+(a.latestText?'<br><span style="color:#8a93a2;font-size:12px">💬 '+esc(a.latestText)+(a.latestAgoSec>=0?' ('+a.latestAgoSec+'s前)':'')+'</span>':'')+'</span><span class="pill idle">'+a.elapsedSec+'s</span></div>').join(''):'<div class="empty">アイドル</div>';
   if(s.subagents && s.subagents.ok===false){ $('subagents').innerHTML='<div class="row"><span style="color:#f87171">⚠️ 取得失敗（要修正）: '+esc(s.subagents.error||'')+'</span><span class="pill stuck">BROKEN</span></div>'; }
   else if(s.subagents && s.subagents.items.length){ $('subagents').innerHTML=s.subagents.items.map(a=>'<div class="row"><span><span class="pill on">'+esc(a.agentType)+'</span> <span style="color:#c9d1d9">'+esc(a.task||'')+'</span><br><span style="color:#8a93a2;font-size:12px">'+(a.latestKind==='tool'?'🔧 ':'💬 ')+esc(a.latest)+' · '+esc(a.session)+'</span></span><span class="pill on">'+a.ageSec+'s前</span></div>').join(''); }
   else { $('subagents').innerHTML='<div class="empty">なし（稼働中サブエージェント無し）</div>'; }
   $('procs').innerHTML=s.claudeProcesses.length?s.claudeProcesses.map(p=>'<div class="row"><span class="mono">pid '+p.pid+' · '+esc(p.session)+'</span><span class="pill on">'+p.etimeSec+'s</span></div>').join(''):'<div class="empty">なし</div>';
-  $('runners').innerHTML=s.runners.length?s.runners.map(r=>'<div class="row"><span class="mono">'+esc(r.channelId)+(r.alive?'':' ☠dead')+'</span><span class="pill '+(!r.alive?'stuck':(r.idleSeconds>120?'idle':'on'))+'">idle '+r.idleSeconds+'s</span></div>').join(''):'<div class="empty">なし</div>';
-  $('parked').innerHTML=s.parked.length?s.parked.map(p=>'<div class="row"><span class="mono">'+esc(p.channelId)+'</span><span class="pill idle">'+p.count+'件</span></div>').join(''):'<div class="empty">なし</div>';
+  $('runners').innerHTML=s.runners.length?s.runners.map(r=>'<div class="row"><span>'+esc(r.channelName||r.channelId)+(r.alive?'':' ☠dead')+'</span><span class="pill '+(!r.alive?'stuck':(r.idleSeconds>120?'idle':'on'))+'">idle '+r.idleSeconds+'s</span></div>').join(''):'<div class="empty">なし</div>';
+  $('parked').innerHTML=s.parked.length?s.parked.map(p=>'<div class="row"><span>'+esc(p.channelName||p.channelId)+'</span><span class="pill idle">'+p.count+'件</span></div>').join(''):'<div class="empty">なし</div>';
  }catch(e){ $('meta').textContent='取得失敗: '+e; }
 }
 tick(); setInterval(tick,3000);
 </script></body></html>`;
 
 /** 読み取り専用の /status サーバを起動する */
-export function startStatusServer(port: number, getCore: () => CoreStatus): http.Server {
+export function startStatusServer(
+  port: number,
+  getCore: () => CoreStatus,
+  resolveChannelName: ChannelNameResolver = (id) => id
+): http.Server {
   const server = http.createServer((req, res) => {
     try {
       const url = (req.url || '/').split('?')[0];
@@ -323,7 +340,7 @@ export function startStatusServer(port: number, getCore: () => CoreStatus): http
           'Content-Type': 'application/json; charset=utf-8',
           'Access-Control-Allow-Origin': '*',
         });
-        res.end(JSON.stringify(buildSnapshot(getCore), null, 2));
+        res.end(JSON.stringify(buildSnapshot(getCore, resolveChannelName), null, 2));
       } else if (url === '/' || url === '/status.html') {
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
         res.end(STATUS_HTML);

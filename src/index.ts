@@ -1485,18 +1485,44 @@ async function main() {
   // 読み取り専用の /status サーバを起動（processingChannels 等のメモリ状態を可視化）
   const statusPort = Number(process.env.STATUS_PORT ?? '8799');
   if (Number.isFinite(statusPort) && statusPort > 0) {
-    startStatusServer(statusPort, () => ({
-      processingChannels: [...processingChannels],
-      runners: agentRunner instanceof RunnerManager ? agentRunner.getStatus().channels : [],
-      activity: [...channelActivity.entries()].map(([ch, a]) => ({
-        channelId: ch,
-        elapsedSec: Math.round((Date.now() - a.startedAt) / 1000),
-        request: a.request,
-        latestText: a.latestText,
-        latestAgoSec: a.latestTextAt ? Math.round((Date.now() - a.latestTextAt) / 1000) : -1,
-      })),
-      dataDir,
-    }));
+    startStatusServer(
+      statusPort,
+      () => {
+        // activity（処理中の中身）と processingChannels（busyロック）の和集合を1本にまとめる。
+        // activity 未設定でも busy な状態（ターン開始直後・park拾いの合間）を取りこぼさない。
+        const acts = [...channelActivity.entries()].map(([ch, a]) => ({
+          channelId: ch,
+          processing: processingChannels.has(ch),
+          elapsedSec: Math.round((Date.now() - a.startedAt) / 1000),
+          request: a.request,
+          latestText: a.latestText,
+          latestAgoSec: a.latestTextAt ? Math.round((Date.now() - a.latestTextAt) / 1000) : -1,
+        }));
+        const known = new Set(acts.map((a) => a.channelId));
+        for (const ch of processingChannels) {
+          if (known.has(ch)) continue;
+          acts.push({
+            channelId: ch,
+            processing: true,
+            elapsedSec: 0,
+            request: '(準備中)',
+            latestText: '',
+            latestAgoSec: -1,
+          });
+        }
+        return {
+          processingChannels: [...processingChannels],
+          runners: agentRunner instanceof RunnerManager ? agentRunner.getStatus().channels : [],
+          activity: acts,
+          dataDir,
+        };
+      },
+      // チャンネルID → Discordのチャンネル名（キャッシュに無ければIDのまま）
+      (id) => {
+        const ch = client.channels.cache.get(id) as { name?: string } | undefined;
+        return ch?.name ? `#${ch.name}` : id;
+      }
+    );
   }
 
   // メッセージ処理
