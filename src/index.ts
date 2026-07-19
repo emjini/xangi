@@ -30,6 +30,7 @@ import {
   restoreTake,
   recoverOrphanedTakes,
 } from './park.js';
+import { startStatusServer } from './status-server.js';
 import { DISCORD_MAX_LENGTH, DISCORD_SAFE_LENGTH, STREAM_UPDATE_INTERVAL_MS } from './constants.js';
 import {
   Scheduler,
@@ -1461,6 +1462,16 @@ async function main() {
 
   // チャンネル単位の処理中ロック
   const processingChannels = new Set<string>();
+
+  // 読み取り専用の /status サーバを起動（processingChannels 等のメモリ状態を可視化）
+  const statusPort = Number(process.env.STATUS_PORT ?? '8799');
+  if (Number.isFinite(statusPort) && statusPort > 0) {
+    startStatusServer(statusPort, () => ({
+      processingChannels: [...processingChannels],
+      runners: agentRunner instanceof RunnerManager ? agentRunner.getStatus().channels : [],
+      dataDir,
+    }));
+  }
 
   // メッセージ処理
   client.on(Events.MessageCreate, async (message) => {
