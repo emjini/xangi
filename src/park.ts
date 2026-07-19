@@ -24,16 +24,22 @@ function parkFilePath(dataDir: string, channelId: string): string {
   return join(parkDir(dataDir), `${channelId}.md`);
 }
 
-/** parkメモを1件追記する（ディレクトリ／ファイルが無ければ作る） */
+/**
+ * parkメモを1件追記する（ディレクトリ／ファイルが無ければ作る）。
+ * 添付ファイルのローカル絶対パスがあれば「📎添付:」として同じ行に残し、拾い上げ時に Read させる。
+ */
 export function addParkedItem(
   dataDir: string,
   channelId: string,
   text: string,
-  timestamp: string
+  timestamp: string,
+  attachmentPaths: string[] = []
 ): void {
   const dir = parkDir(dataDir);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-  const line = `- [${timestamp}] ${text.replace(/\s*\n\s*/g, ' ').trim()}\n`;
+  const cleanText = text.replace(/\s*\n\s*/g, ' ').trim();
+  const attachSuffix = attachmentPaths.length > 0 ? ` 📎添付: ${attachmentPaths.join(' ')}` : '';
+  const line = `- [${timestamp}] ${cleanText}${attachSuffix}\n`;
   appendFileSync(parkFilePath(dataDir, channelId), line, 'utf-8');
 }
 

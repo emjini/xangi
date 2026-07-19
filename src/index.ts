@@ -1488,18 +1488,43 @@ async function main() {
       if (parkRaw === '!park' || /^!park\s/.test(parkRaw)) {
         if (!config.discord.allowedUsers?.includes(message.author.id)) return;
         const body = parkRaw.replace(/^!park\s*/, '').trim();
-        if (!body) {
+
+        // 添付ファイルをダウンロード（通常フローと同じ置き場に永続化＝拾い上げ時まで残る）
+        const parkAttachments: string[] = [];
+        if (message.attachments.size > 0) {
+          for (const [, attachment] of message.attachments) {
+            try {
+              const fp = await downloadFile(attachment.url, attachment.name || 'file');
+              parkAttachments.push(fp);
+            } catch (err) {
+              console.error(`[park] Failed to download attachment: ${attachment.name}`, err);
+            }
+          }
+        }
+
+        // 本文も添付も無ければ park しない
+        if (!body && parkAttachments.length === 0) {
           await message.react('❓').catch(() => {});
           return;
         }
+
         const ts = new Date().toLocaleString('ja-JP', {
           timeZone: 'Asia/Tokyo',
           hour: '2-digit',
           minute: '2-digit',
         });
-        addParkedItem(dataDir, message.channel.id, body, ts);
+        addParkedItem(
+          dataDir,
+          message.channel.id,
+          body || '(本文なし・添付のみ)',
+          ts,
+          parkAttachments
+        );
         await message.react('📌').catch(() => {});
-        console.log(`[park] Parked item in channel ${message.channel.id}`);
+        console.log(
+          `[park] Parked item in channel ${message.channel.id}` +
+            (parkAttachments.length ? ` (+${parkAttachments.length} attachment(s))` : '')
+        );
         return;
       }
     }
@@ -1663,7 +1688,7 @@ async function main() {
         parkCycles++;
         console.log(`[park] Picking up parked items in channel ${channelId} (cycle ${parkCycles})`);
         try {
-          const parkPrompt = `【park：作業中に届いた追加メモ】\n直前の作業は完了しています。以下はユーザーが作業中に park（一時保存）した追加の依頼・情報です。内容を確認し、対応が必要なものに取り組んでください。複数あれば順に対応を。\n\n${take.content}`;
+          const parkPrompt = `【park：作業中に届いた追加メモ】\n直前の作業は完了しています。以下はユーザーが作業中に park（一時保存）した追加の依頼・情報です。内容を確認し、対応が必要なものに取り組んでください。複数あれば順に対応を。\n「📎添付:」の後にファイルの絶対パスがある場合は、必ず Read でその内容（画像等）を確認してから対応すること。\n\n${take.content}`;
           const parkResult = await processPrompt(
             message,
             agentRunner,
