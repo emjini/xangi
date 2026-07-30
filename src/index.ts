@@ -13,6 +13,8 @@ import { initSessions } from './sessions.js';
 import { join } from 'path';
 import { config as dotenvConfig } from 'dotenv';
 import { startWebChat } from './web-chat.js';
+import { startStatusServer } from './status-server.js';
+import { listActivities } from './activity-store.js';
 import { startLineBot } from './line.js';
 import { formatTelegramError, startTelegramBot } from './telegram.js';
 import { getEventsConfig } from './events-emitter.js';
@@ -228,6 +230,33 @@ async function main() {
   const { startToolServer } = await import('./tool-server.js');
   const { EventTrigger, loadTriggerConfig } = await import('./event-trigger.js');
   startToolServer({ eventTrigger: new EventTrigger(loadTriggerConfig(), scheduler) });
+
+  // 読み取り専用の /status サーバ（OS視点: 稼働中の claude プロセスと
+  // どのチャンネル/サブエージェントのものかを可視化）。
+  // 上流の /monitor（xangi内部視点）とは見ているレイヤーが違うので併存させる。
+  const statusPort = Number(process.env.STATUS_PORT ?? '8799');
+  if (Number.isFinite(statusPort) && statusPort > 0) {
+    startStatusServer(
+      statusPort,
+      () => {
+        const acts = listActivities().map(({ threadId, snapshot }) => ({
+          channelId: threadId.replace(/^discord:/, ''),
+          processing: snapshot.state === 'streaming' || snapshot.state === 'thinking',
+          elapsedSec: Math.round((Date.now() - snapshot.startedAt) / 1000),
+          request: snapshot.userTextPreview ?? snapshot.summary ?? '',
+          latestText: snapshot.textPreview ?? '',
+          latestAgoSec: Math.round((Date.now() - snapshot.updatedAt) / 1000),
+        }));
+        return {
+          processingChannels: acts.filter((a) => a.processing).map((a) => a.channelId),
+          runners: [],
+          activity: acts,
+          dataDir,
+        };
+      }
+    );
+    console.log(`[status-server] Listening on http://0.0.0.0:${statusPort}`);
+  }
 
   // Discord ボット: トークン未設定 (Web オンリーモード等) では Client を生成しない。
   // 生成だけでも discord.js の内部リソースを確保するし、login しない Client が

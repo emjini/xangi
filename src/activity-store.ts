@@ -313,6 +313,19 @@ export function getActivity(threadId: string, at: number = now()): ActivitySnaps
   };
 }
 
+/**
+ * 稼働中/直近の activity を一覧で返す（/status ダッシュボード用に追加）。
+ * getActivity は threadId 単位のため、横断で見るには一覧が要る。
+ */
+export function listActivities(at: number = now()): Array<{ threadId: string; snapshot: ActivitySnapshot }> {
+  const out: Array<{ threadId: string; snapshot: ActivitySnapshot }> = [];
+  for (const threadId of activities.keys()) {
+    const snapshot = getActivity(threadId, at);
+    if (snapshot) out.push({ threadId, snapshot });
+  }
+  return out;
+}
+
 export function clearActivities(): void {
   activities.clear();
 }
