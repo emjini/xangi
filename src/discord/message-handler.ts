@@ -13,6 +13,7 @@ import { consumeRestartNote } from '../restart-note.js';
 import { ClaudeCodeRunner } from '../claude-code.js';
 import { runWithBubbleEvents } from '../bubble-events-runner.js';
 import { threadIdFor, turnIdFor } from '../events-emitter.js';
+import { join } from 'path';
 import { downloadFile, buildAttachmentResult, buildPromptWithAttachments } from '../file-utils.js';
 import { splitMessage } from '../message-split.js';
 import { DISCORD_MAX_LENGTH, DISCORD_SAFE_LENGTH } from '../constants.js';
@@ -76,6 +77,28 @@ import {
   prefetchDiscordHistory,
 } from './message-utils.js';
 import { buildPrefetchedHistoryBlock } from '../prefetched-history.js';
+
+import {
+  addParkedItem,
+  takeParkedItems,
+  commitTake,
+  restoreTake,
+} from '../park.js';
+
+// park拾い上げの1ターンあたり最大サイクル数（無限ループ防止。超過分は次ターンへ繰り越し）
+const MAX_PARK_PICKUP_CYCLES = 5;
+
+
+/** park された内容を、拾い上げターン用のプロンプトに整形する */
+function buildParkPrompt(content: string): string {
+  return (
+    '【park：作業中に届いた追加メモ】\n' +
+    '直前の作業は完了しています。以下はユーザーが作業中に park（一時保存）した追加の依頼・情報です。' +
+    '内容を確認し、対応が必要なものに取り組んでください。複数あれば順に対応を。\n' +
+    '「📎添付:」の後にファイルの絶対パスがある場合は、必ず Read でその内容（画像等）を確認してから対応すること。\n\n' +
+    content
+  );
+}
 
 export function shouldProcessDiscordMessage(input: { system?: boolean }): boolean {
   return !input.system;
@@ -707,6 +730,8 @@ export interface MessageHandlerDeps {
  */
 export function registerDiscordMessageHandlers(deps: MessageHandlerDeps): void {
   const { client, config, agentRunner, workdir } = deps;
+  // park の保存先（index.ts の DATA_DIR 既定と揃える）
+  const dataDir = process.env.DATA_DIR || join(workdir, '.xangi');
 
   // 実行キー単位の処理中ロック。Discord のスレッド返信モードでは、親チャンネルに
   // 届いた発言から先に thread を作って runKey を確定し、Slack の conversationKey と
@@ -920,6 +945,36 @@ export function registerDiscordMessageHandlers(deps: MessageHandlerDeps): void {
     const target = await resolveDiscordMessageTarget(message, channelId, config, settings);
     const runKey = target.conversationChannelId;
 
+    // !park: 作業中でも受け取れるクイックストック。エージェントを起動せず溜めるだけ。
+    // busyガードより前に処理する（＝処理中でも park できる）。次のターン完了後に自動で拾い上げる。
+    {
+      const parkRaw = message.content.replace(/<@[!&]?\d+>/g, '').trim();
+      if (parkRaw === '!park' || /^!park\s/.test(parkRaw)) {
+        const body = parkRaw.replace(/^!park\s*/, '').trim();
+        const parkAttachments: string[] = [];
+        for (const attachment of message.attachments.values()) {
+          try {
+            const fp = await downloadFile(attachment.url, attachment.name || 'file');
+            if (fp) parkAttachments.push(fp);
+          } catch (err) {
+            console.error(`[park] Failed to download attachment: ${attachment.name}`, err);
+          }
+        }
+        // 本文も添付も無ければ park しない
+        if (!body && parkAttachments.length === 0) {
+          await message.react('❓').catch(() => {});
+          return;
+        }
+        addParkedItem(dataDir, channelId, body, message.author.username, parkAttachments);
+        console.log(
+          `[park] Parked item in channel ${channelId}` +
+            (parkAttachments.length ? ` (+${parkAttachments.length} attachment(s))` : '')
+        );
+        await message.react('📥').catch(() => {});
+        return;
+      }
+    }
+
     // 同じ実行キーで処理中なら無視（メンション時は除く）
     if (!isMentioned && processingRuns.has(runKey)) {
       console.log(`[xangi] Skipping message in busy run: ${runKey}`);
@@ -929,6 +984,38 @@ export function registerDiscordMessageHandlers(deps: MessageHandlerDeps): void {
     processingRuns.add(runKey);
     try {
       await processPrompt(message, agentRunner, prompt, skipPermissions, channelId, config, target);
+
+      // park拾い: 現在の作業が終わったら、溜まった park メモを別ターン
+      //（＝別タイムアウト枠）で処理する。無限ループ防止に上限サイクルを設ける。
+      let parkCycles = 0;
+      while (parkCycles < MAX_PARK_PICKUP_CYCLES) {
+        const take = takeParkedItems(dataDir, channelId);
+        if (!take) break;
+        parkCycles++;
+        console.log(`[park] Picking up parked items in channel ${channelId} (cycle ${parkCycles})`);
+        try {
+          const parkPrompt = buildParkPrompt(take.content);
+          await processPrompt(
+            message,
+            agentRunner,
+            parkPrompt,
+            skipPermissions,
+            channelId,
+            config,
+            target
+          );
+          commitTake(take);
+        } catch (parkErr) {
+          restoreTake(dataDir, take);
+          console.error('[park] Pickup failed; restored items for next turn:', parkErr);
+          break;
+        }
+      }
+      if (parkCycles >= MAX_PARK_PICKUP_CYCLES) {
+        console.warn(
+          `[park] Reached max pickup cycles in channel ${channelId}; remaining items deferred to next turn`
+        );
+      }
     } finally {
       processingRuns.delete(runKey);
     }

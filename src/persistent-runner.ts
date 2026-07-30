@@ -9,7 +9,14 @@ import type {
   ExtendTimeoutResult,
 } from './agent-runner.js';
 import { mergeTexts, sanitizeSurrogates, prependRuntimeContext } from './agent-runner.js';
-import { stripToolCallArtifacts, finalizeDisplayText } from './tool-call-sanitize.js';
+// 【自作差し替え】上流 tool-call-sanitize はコードブロック内の例示タグまで消すため使わない
+// （2026-07-30 実測）。除去はコードブロック保護版の tool-corruption-filter を使う。
+import {
+  stripToolCorruption as stripToolCallArtifacts,
+  finalizeDisplayTextSafe as finalizeDisplayText,
+  detectToolCorruption,
+  logToolCorruption,
+} from './tool-corruption-filter.js';
 import { DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, TIMEOUT_EXTEND_ENABLED } from './constants.js';
 import { buildPersistentSystemPrompt } from './base-runner.js';
 import type { ChatPlatform } from './prompts/index.js';
