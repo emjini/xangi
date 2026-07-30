@@ -79,11 +79,19 @@ import {
 import { buildPrefetchedHistoryBlock } from '../prefetched-history.js';
 
 import {
+  createThreadStateController,
+  type ThreadStateController,
+} from './thread-state.js';
+import {
   addParkedItem,
   takeParkedItems,
   commitTake,
   restoreTake,
 } from '../park.js';
+
+// スレッド状態(🟢🟡🔵)コントローラ。registerDiscordMessageHandlers で client を得てから初期化する。
+// processPrompt は上流の呼び出し側が5箇所あり引数追加は衝突面を広げるため、モジュールスコープで保持する。
+let threadState: ThreadStateController | null = null;
 
 // park拾い上げの1ターンあたり最大サイクル数（無限ループ防止。超過分は次ターンへ繰り越し）
 const MAX_PARK_PICKUP_CYCLES = 5;
@@ -230,6 +238,8 @@ export async function processPrompt(
     receivedAt: message.createdTimestamp,
     workdir: config.agent.config.workdir,
   });
+  // 応答が長引いたらスレッドを🔵にする（完了時/エラー時に確定状態で上書きされる）
+  const threadStatusTimer = threadState?.startBlueTimer(message.channel);
   try {
     console.log(
       `[xangi] Processing message in channel ${channelId}, runKey ${conversationChannelId}`
@@ -409,6 +419,7 @@ export async function processPrompt(
           }
         );
       } finally {
+    if (threadStatusTimer) clearTimeout(threadStatusTimer);
         session.finish();
       }
       result = streamResult.result;
@@ -579,6 +590,11 @@ export async function processPrompt(
 
     latency.finish('complete');
 
+    // 応答末尾のステータスタグ（🟢🟡🔵）を読み取ってスレッドへ反映
+    await threadState
+      ?.applyThreadStateFromResponse(extracted.text, message, channelId)
+      .catch((e) => console.error('[thread-status] apply failed:', e));
+
     return extracted.text;
   } catch (error) {
     latency.markAgentComplete();
@@ -618,6 +634,8 @@ export async function processPrompt(
       await replyMessage.edit({ content: errorMessage, components: [] }).catch(() => {});
     } else {
       await message.reply(errorMessage).catch(() => {});
+      // エラー時はえみぽぬさんの判断待ち＝🟡
+      await threadState?.applyThreadStateFromResponse('🟡', message, channelId).catch(() => {});
     }
 
     // エラー後にエージェントへ自動フォローアップ。
@@ -732,6 +750,8 @@ export function registerDiscordMessageHandlers(deps: MessageHandlerDeps): void {
   const { client, config, agentRunner, workdir } = deps;
   // park の保存先（index.ts の DATA_DIR 既定と揃える）
   const dataDir = process.env.DATA_DIR || join(workdir, '.xangi');
+  // スレッド状態コントローラを初期化（client が必要なためここで）
+  threadState = createThreadStateController(client);
 
   // 実行キー単位の処理中ロック。Discord のスレッド返信モードでは、親チャンネルに
   // 届いた発言から先に thread を作って runKey を確定し、Slack の conversationKey と
