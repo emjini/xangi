@@ -104,6 +104,11 @@ export class RunnerManager extends EventEmitter implements AgentRunner {
 
     // タイムアウト状態の変化を上位に bubble up
     // (web-chat から events-emitter (SSE) や UI へ伝えるため)
+    // 自発ターン（バックグラウンドタスク完了通知など）の応答を上位へ転送
+    runner.on('unsolicited-message', (ch: string, text: string) => {
+      this.emit('unsolicited-message', ch, text);
+    });
+
     for (const evt of ['timeout-started', 'timeout-extended', 'timeout-cleared'] as const) {
       runner.on(evt, (payload: unknown) => {
         this.emit(evt, payload);

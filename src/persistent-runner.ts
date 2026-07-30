@@ -426,8 +426,17 @@ export class PersistentRunner extends EventEmitter implements AgentRunner {
           sessionId: this.sessionId,
         };
 
-        this.currentItem?.callbacks?.onComplete?.(result);
-        this.currentItem?.resolve(result);
+        if (this.currentItem) {
+          this.currentItem.callbacks?.onComplete?.(result);
+          this.currentItem.resolve(result);
+        } else if (this.fullText.trim()) {
+          // リクエスト起点のないターン（バックグラウンドタスク完了通知など）の応答。
+          // 上流は currentItem が無いと黙って破棄するため、イベントで通知してチャンネルへ届ける。
+          console.log(
+            `[persistent-runner] Unsolicited turn completed (${this.fullText.length} chars)`
+          );
+          this.emit('unsolicited-message', this.channelId, this.fullText);
+        }
       }
 
       this.currentItem = null;

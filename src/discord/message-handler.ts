@@ -14,7 +14,13 @@ import { ClaudeCodeRunner } from '../claude-code.js';
 import { runWithBubbleEvents } from '../bubble-events-runner.js';
 import { threadIdFor, turnIdFor } from '../events-emitter.js';
 import { join } from 'path';
-import { downloadFile, buildAttachmentResult, buildPromptWithAttachments } from '../file-utils.js';
+import {
+  downloadFile,
+  buildAttachmentResult,
+  buildPromptWithAttachments,
+  extractFilePaths,
+  stripFilePaths,
+} from '../file-utils.js';
 import { splitMessage } from '../message-split.js';
 import { DISCORD_MAX_LENGTH, DISCORD_SAFE_LENGTH } from '../constants.js';
 import { StreamSession } from '../stream-session.js';
@@ -106,6 +112,61 @@ function buildParkPrompt(content: string): string {
     '「📎添付:」の後にファイルの絶対パスがある場合は、必ず Read でその内容（画像等）を確認してから対応すること。\n\n' +
     content
   );
+}
+
+
+/**
+ * リクエスト起点のない応答（バックグラウンドタスクの完了通知への応答など）をチャンネルへ配信する。
+ *
+ * 上流は currentItem が無いターンの応答を破棄するため、persistent-runner が
+ * 'unsolicited-message' を emit → runner-manager が中継 → ここで Discord へ送る。
+ *
+ * ⭐ 自作の !discord/!schedule テキストパースは移植していない（上流の xangi-cmd 方式へ
+ *    乗り換えたため）。よってここでは添付抽出と分割送信だけを行えばよい。
+ */
+export async function deliverUnsolicitedResponse(
+  client: Client,
+  channelId: string,
+  result: string
+): Promise<void> {
+  try {
+    if (!channelId || channelId === '__default__') {
+      console.warn('[xangi] Unsolicited response has no channel context. Dropping.');
+      return;
+    }
+    const channel = await client.channels.fetch(channelId);
+    if (!channel || !('send' in channel)) {
+      console.warn(`[xangi] Unsolicited response channel ${channelId} is not sendable.`);
+      return;
+    }
+    const sendable = channel as unknown as {
+      send: (content: string | { files: { attachment: string }[] }) => Promise<unknown>;
+    };
+
+    const filePaths = extractFilePaths(result);
+    const displayText = filePaths.length > 0 ? stripFilePaths(result) : result;
+
+    if (displayText.trim()) {
+      for (const chunk of splitMessage(displayText, DISCORD_SAFE_LENGTH)) {
+        await sendable.send(chunk);
+      }
+    }
+
+    if (filePaths.length > 0) {
+      try {
+        await sendable.send({ files: filePaths.map((fp: string) => ({ attachment: fp })) });
+        console.log(`[xangi] Sent ${filePaths.length} file(s) (unsolicited)`);
+      } catch (err) {
+        console.error('[xangi] Failed to send files (unsolicited):', err);
+      }
+    }
+
+    console.log(
+      `[xangi] Delivered unsolicited response to channel ${channelId} (${result.length} chars)`
+    );
+  } catch (err) {
+    console.error('[xangi] Failed to deliver unsolicited response:', err);
+  }
 }
 
 export function shouldProcessDiscordMessage(input: { system?: boolean }): boolean {
@@ -752,6 +813,13 @@ export function registerDiscordMessageHandlers(deps: MessageHandlerDeps): void {
   const dataDir = process.env.DATA_DIR || join(workdir, '.xangi');
   // スレッド状態コントローラを初期化（client が必要なためここで）
   threadState = createThreadStateController(client);
+
+  // 自発ターン（バックグラウンドタスク完了通知など）の応答をチャンネルへ配信
+  (agentRunner as unknown as {
+    on?: (ev: string, cb: (ch: string, text: string) => void) => void;
+  }).on?.('unsolicited-message', (ch: string, text: string) => {
+    void deliverUnsolicitedResponse(client, ch, text);
+  });
 
   // 実行キー単位の処理中ロック。Discord のスレッド返信モードでは、親チャンネルに
   // 届いた発言から先に thread を作って runKey を確定し、Slack の conversationKey と
