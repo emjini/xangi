@@ -50,7 +50,7 @@ export class DynamicRunnerManager extends EventEmitter implements AgentRunner {
     this.defaultRunner = createAgentRunner(config.agent.backend, config.agent.config, {
       platform: this.platform,
     });
-    this.attachTimeoutBubble(this.defaultRunner);
+    this.attachEventBubble(this.defaultRunner);
 
     console.log(
       `[dynamic-runner] Initialized with default backend: ${getBackendDisplayName(config.agent.backend)}`
@@ -58,18 +58,30 @@ export class DynamicRunnerManager extends EventEmitter implements AgentRunner {
   }
 
   /**
-   * 内部 runner が EventEmitter なら timeout-* を上位 (= web-chat の SSE) に bubble する。
-   * 既に attach 済みかどうかは listener 名で判別不能なので、attach は 1 runner 1 回が前提。
+   * 内部 runner が EventEmitter なら、上位 (= web-chat の SSE / Discord 配信) へ
+   * イベントを bubble する。既に attach 済みかどうかは listener 名で判別不能なので、
+   * attach は 1 runner 1 回が前提。
    * (defaultRunner は constructor で、channelRunner は createRunnerFor 直後で attach する)
+   *
+   * ⛔ここに載せ忘れたイベントは、EventEmitter がリスナー不在を黙って捨てるため
+   *   エラーも警告も出ずに消える。新しいイベントを増やしたら必ずここへ追加すること。
    */
-  private attachTimeoutBubble(runner: AgentRunner): void {
+  private attachEventBubble(runner: AgentRunner): void {
     const emitter = runner as unknown as {
-      on?: (e: string, l: (p: unknown) => void) => void;
+      on?: (e: string, l: (...args: unknown[]) => void) => void;
     };
     if (typeof emitter.on !== 'function') return;
     for (const evt of ['timeout-started', 'timeout-extended', 'timeout-cleared'] as const) {
       emitter.on(evt, (payload: unknown) => this.emit(evt, payload));
     }
+    // ⭐自発ターン（バックグラウンドタスク完了通知など、currentItem 起点の無い応答）。
+    // 2026-07-30 の上流移植で RunnerManager の上に本クラスが挟まったが、移植コミット
+    // 43f0a57「3層で復活」は旧構造のまま3層しか繋がず、ここで中継が切れていた。
+    // 結果、自発ターンの応答が Discord へ一切届かず、しかも無言で消えていた
+    // （2026-08-01 再現テストで確定・発火1件/配信0件）。ペイロードは (channelId, text) の2引数。
+    emitter.on('unsolicited-message', (...args: unknown[]) =>
+      this.emit('unsolicited-message', ...args)
+    );
   }
 
   /**
@@ -108,7 +120,7 @@ export class DynamicRunnerManager extends EventEmitter implements AgentRunner {
 
     // 新しいランナーを作成
     const runner = this.createRunnerFor(resolved, runnerPlatform, channelId);
-    this.attachTimeoutBubble(runner);
+    this.attachEventBubble(runner);
     this.channelRunners.set(channelId, {
       runner,
       key: channelRunnerKey,
