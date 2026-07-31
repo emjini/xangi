@@ -126,5 +126,26 @@ if command -v jq &>/dev/null; then
     exit 1
   fi
 else
-  echo "$RESPONSE"
+  # jq が無い環境向けのフォールバック。
+  #
+  # ⛔ここで ok:false を見落とすと、サーバー側のエラーを stdout へ流したうえ
+  #   終了コード0（＝成功）で返してしまい、呼び出し側は失敗に気づけない。
+  #   2026-08-01 まで実際にそうなっていた（jq 未導入のラズパイで、全コマンドが
+  #   この経路を通っていた）。jq の有無で成否判定が変わってはならない。
+  if echo "$RESPONSE" | grep -qE '"ok"[[:space:]]*:[[:space:]]*true'; then
+    echo "$RESPONSE"
+  else
+    # jq 無しで .error を取り出す。エスケープされた " を含む値も拾えるようにする
+    ERROR_MSG=$(echo "$RESPONSE" | sed -n 's/.*"error"[[:space:]]*:[[:space:]]*"\(\([^"\\]\|\\.\)*\)".*/\1/p')
+    if [ -n "$ERROR_MSG" ]; then
+      # 最小限のエスケープ解除。\uXXXX は解釈しないので生のまま残る（jq を推奨する理由）
+      ERROR_MSG=$(printf '%s' "$ERROR_MSG" | sed 's/\\"/"/g; s/\\n/\
+/g; s/\\\\/\\/g')
+      echo "Error: $ERROR_MSG" >&2
+    else
+      echo "Error: 予期しないレスポンス: $RESPONSE" >&2
+    fi
+    echo "Hint: jq が未導入のため簡易解析です。jq を入れると正確になります" >&2
+    exit 1
+  fi
 fi

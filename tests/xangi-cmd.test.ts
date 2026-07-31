@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { createServer, type Server } from 'http';
 import { spawn } from 'child_process';
-import { mkdtempSync, writeFileSync } from 'fs';
+import { existsSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { fileURLToPath } from 'url';
@@ -167,6 +167,63 @@ describe('xangi-cmd CLI error handling', () => {
 
     expect(stderr).toContain('接続できません');
     expect(code).not.toBe(0);
+  });
+});
+
+/**
+ * jq が無い環境のリグレッションテスト。
+ *
+ * xangi-cmd は jq があれば .ok を見て成否を判定するが、無い場合は生の
+ * レスポンスを stdout に出すだけだった。そのためサーバーが 4xx/5xx と
+ * ok:false を返しても **終了コード0（成功）** で返り、呼び出し側は失敗に
+ * 気づけなかった。2026-08-01 まで実機（jq 未導入のラズパイ）が全コマンドで
+ * この経路を通っており、送信失敗を握り潰していた。
+ *
+ * jq を導入した環境ではこの経路を踏まないため、PATH から jq を除いて明示的に
+ * 検証する。
+ */
+describe('xangi-cmd CLI without jq', () => {
+  let noJqBin = '';
+
+  beforeAll(() => {
+    // jq を含まない PATH を作る。スクリプトが使う外部コマンドだけを symlink する
+    noJqBin = mkdtempSync(join(tmpdir(), 'xangi-nojq-'));
+    for (const cmd of ['sed', 'awk', 'curl', 'grep']) {
+      const found = ['/usr/bin', '/bin', '/usr/local/bin']
+        .map((dir) => join(dir, cmd))
+        .find((p) => existsSync(p));
+      if (found) symlinkSync(found, join(noJqBin, cmd));
+    }
+  });
+
+  afterAll(() => {
+    rmSync(noJqBin, { recursive: true, force: true });
+  });
+
+  it('reports server errors on stderr and exits non-zero even without jq', async () => {
+    setMockResponse({
+      status: 400,
+      body: JSON.stringify({ ok: false, error: 'discord_send: channel が未指定です。' }),
+    });
+
+    const { stdout, stderr, code } = await runCli(['discord_send'], { PATH: noJqBin });
+
+    expect(stderr).toContain('channel が未指定');
+    expect(code).not.toBe(0);
+    // 握り潰しの退行検出: エラー本文が stdout（＝成功出力）へ流れてはいけない
+    expect(stdout).not.toContain('channel が未指定');
+  });
+
+  it('still succeeds on ok:true without jq', async () => {
+    setMockResponse({
+      status: 200,
+      body: JSON.stringify({ ok: true, result: 'sent' }),
+    });
+
+    const { stdout, code } = await runCli(['discord_send'], { PATH: noJqBin });
+
+    expect(stdout).toContain('sent');
+    expect(code).toBe(0);
   });
 });
 
