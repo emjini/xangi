@@ -11,18 +11,21 @@ import type {
 import { mergeTexts, sanitizeSurrogates, prependRuntimeContext } from './agent-runner.js';
 // 【自作差し替え】上流 tool-call-sanitize はコードブロック内の例示タグまで消すため使わない
 // （2026-07-30 実測）。除去はコードブロック保護版の tool-corruption-filter を使う。
+// ⚠️ detectToolCorruption / logToolCorruption は import されていたが本ファイルでは
+//    一度も呼ばれておらず、eslint(no-unused-vars) に引っかかっていた（2026-07-31 に判明）。
+//    ⛔**この経路に破損検出のログが掛かっていない**ということなので、配線が要るかは要検討。
+//    ⚠️ただし勝手に呼ぶと正常な出力を誤って落としかねないので、ここでは import の削除に留める。
+//    ⭐実際に使っているのは claude-code.ts のみ。stripToolCorruption / finalizeDisplayTextSafe は本ファイルでも使用中。
 import {
   stripToolCorruption as stripToolCallArtifacts,
   finalizeDisplayTextSafe as finalizeDisplayText,
-  detectToolCorruption,
-  logToolCorruption,
 } from './tool-corruption-filter.js';
 import { DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, TIMEOUT_EXTEND_ENABLED } from './constants.js';
 import { buildPersistentSystemPrompt } from './base-runner.js';
 import type { ChatPlatform } from './prompts/index.js';
 import { logPrompt, logResponse, logError } from './transcript-logger.js';
 import { buildCliEnv } from './cli-process.js';
-import { appendJsonlChunk } from './jsonl-buffer.js';
+import { appendJsonlChunk, flushJsonlBuffer } from './jsonl-buffer.js';
 import { configuredBackendCommand } from './setup/backend-executable.js';
 
 /**
@@ -204,6 +207,19 @@ export class PersistentRunner extends EventEmitter implements AgentRunner {
       const wasShuttingDown = this.shuttingDown;
       this.process = null;
       this.processAlive = false;
+      // ⭐プロセス終了時、改行で終わっていない最終行を取りこぼさない（2026-07-31 追加）。
+      // ⛔旧実装は無条件に捨てていたため、**結果メッセージが改行なしで終わると応答が丸ごと消えた**
+      //   （cli-runner-core は flushJsonlBuffer で回収済みなのに、こちらだけ未対応だった）
+      for (const line of flushJsonlBuffer(this.buffer)) {
+        try {
+          this.handleJsonMessage(JSON.parse(line));
+        } catch {
+          console.warn(
+            '[persistent-runner] Discarding unparsable tail on close:',
+            line.slice(0, 100)
+          );
+        }
+      }
       this.buffer = ''; // バッファをクリア
 
       // シャットダウン中またはキャンセル中なら正常終了。
@@ -300,6 +316,13 @@ export class PersistentRunner extends EventEmitter implements AgentRunner {
   private handleOutput(data: string): void {
     const parsed = appendJsonlChunk(this.buffer, data);
     this.buffer = parsed.buffer;
+    // ⛔改行なしで上限を超えた残骸は捨てられる。黙って消さず必ず記録する（2026-07-31 追加）
+    if (parsed.dropped !== undefined) {
+      console.error(
+        `[persistent-runner] Dropped ${parsed.dropped} chars of unterminated output (no newline within buffer limit). ` +
+          'The response for this request may be incomplete.'
+      );
+    }
 
     for (const line of parsed.lines) {
       try {
